@@ -40,6 +40,10 @@ redis==8.1.0
 resvg_py==0.5.0
 SQLAlchemy==2.0.54
 starlette==1.7.0
+# Windows 上 zoneinfo 没有系统 tzdata，PyInstaller 打包与 check_runtime.py
+# 的 ZoneInfo('Asia/Shanghai') 断言都依赖这个包。requirements.txt 里早就有，
+# 但这份 lock 从 v1.0.0 起就漏了 —— 结果是 CI 构建必然在 check_runtime 失败。
+tzdata==2026.6
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.54.0
