@@ -59,15 +59,24 @@ def describe_model(model: dict, platform: str = "") -> str:
         return ""
 
     # 1) 上游真的给了描述
+    #
+    # ⚠️ 键名各家不一样，必须尽量穷举。实测（2026-11-03）：
+    #   小浣熊 /model_catalog 用的是 `display_description`
+    #   其它平台用 `description` / `descriptionZh` 等
+    # 早期只认后几种，于是小浣熊 9 个模型的描述全部落空、显示成空字符串 ——
+    # 而它的模型名本身是代号（`raccoon-090dd3` / `sn-glm-5-3`），
+    # 没有描述用户根本不知道那是什么模型、该不该开。
     for key in ("descriptionZh", "descriptionEn", "description",
-                "desc", "summary", "intro"):
+                "display_description", "displayDescription",
+                "desc", "summary", "intro", "introduction",
+                "display_name_description", "remark"):
         value = model.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     # 嵌套在 x_<platform> 里的
     for key, value in model.items():
         if isinstance(key, str) and key.startswith("x_") and isinstance(value, dict):
-            for sub in ("description", "desc", "summary"):
+            for sub in ("description", "display_description", "desc", "summary"):
                 text = value.get(sub)
                 if isinstance(text, str) and text.strip():
                     return text.strip()

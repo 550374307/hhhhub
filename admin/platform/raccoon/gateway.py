@@ -1286,6 +1286,12 @@ async def list_models(request):
     payload = [{"id": m["name"], "object": "model",
                 "owned_by": "raccoon",
                 "display_name": m.get("display") or m["name"],
+                # ⚠️ 必须带上描述：模型名是代号（`raccoon-090dd3` /
+                # `sn-glm-5-3`），没有描述用户在模型配置里根本看不出
+                # 它是什么、该不该开。上游 `/model_catalog` 的
+                # `display_description` 正是那条文案，漏传就等于丢掉了
+                # 唯一能解释模型用途的信息。
+                "description": m.get("description") or "",
                 "visible": bool(m.get("visible", True))}
                for m in models]
     return JSONResponse({"object": "list", "data": payload})
