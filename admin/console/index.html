@@ -10375,9 +10375,19 @@ async function renderAggregatedModels() {
     ].filter(Boolean).join(" ").toLowerCase();
     return hay.includes(term);
   };
-  const allMulti = (data.items || []).filter(item => item.platform_count > 1);
-  const items = allMulti.filter(matches);
-  const multi = allMulti.length;
+  // ⚠️ 不能只渲染 `platform_count > 1` 的组。
+  //
+  // 早期这里写的是 `filter(item => item.platform_count > 1)`，本意是
+  // 「聚合视图用来对比跨平台模型」。但实际有 65/69 组是单平台的
+  // （raccoon 的 9 个模型全部单平台），于是它们**在界面上彻底消失** ——
+  // 用户看到「只有 4 个模型」，而库里明明有 82 条。
+  //
+  // 现在的行为：默认显示**全部**组，多平台的排在前面（后端已按
+  // platform_count 降序排好），单平台的排在后面。这样既能对比，
+  // 也不会藏模型。想只看多平台时用搜索/平台过滤。
+  const allGroups = data.items || [];
+  const items = allGroups.filter(matches);
+  const multi = allGroups.filter(item => item.platform_count > 1).length;
   if (pager) {
     pager.innerHTML = `<span class="text-xs" style="color:var(--fg-subtle)">
       共 ${data.total_models} 个模型 · 聚合为 ${data.total_groups} 组 ·
@@ -10399,8 +10409,8 @@ async function renderAggregatedModels() {
   if (!items.length) {
     body.innerHTML = `<tr><td colspan="5" class="px-4 py-8 text-center"
       style="color:var(--fg-subtle)">${
-        term || platformFilter ? `没有匹配「${esc(term || platformFilter)}」的跨平台模型`
-          : "没有跨平台的同名模型"}</td></tr>`;
+        term || platformFilter ? `没有匹配「${esc(term || platformFilter)}」的模型`
+          : "还没有模型配置，点击「从后端同步模型」拉取可用模型列表"}</td></tr>`;
     return;
   }
 
