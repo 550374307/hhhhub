@@ -971,9 +971,29 @@ _EXHAUSTION_HINTS = {
 }
 
 
+def _redact_upstream(text: str, limit: int = 300) -> str:
+    """把上游原文里可能承载凭证的片段打码后再对外展示。
+
+    实现统一放在 `admin.upstream_errors.redact`（13 种凭证形态有单测覆盖），
+    这里只做薄封装，避免各模块各写一份正则、慢慢漂移不一致。
+
+    背景：上游错误体常回显 `Authorization: Bearer <token>`，
+    而 `_exhaustion_message` 的结果会直接回给调用方（任意持 Key 的人，
+    不需要管理员），且会经 `last_upstream_error` 持久化后反复出现。
+    """
+    from admin.upstream_errors import redact
+
+    return redact(text, limit)
+
+
 def _exhaustion_message(kind: str, last_msg: str, tried_accounts: int,
                         tried_models: int, upstream_status: int = 0) -> str:
-    """Present gateway interpretation, client explanation and upstream evidence."""
+    """Present gateway interpretation, client explanation and upstream evidence.
+
+    ⚠️ 对外文本里的上游原文必须过 `_redact_upstream()`：这条消息会直接
+    回给调用方（任意持 Key 的人，不需要管理员），而上游错误体可能回显
+    `Authorization`。完整原文仍然由调用方在日志里留档。
+    """
     hint = _EXHAUSTION_HINTS.get(kind or "", "未知错误")
     tried = f"账号调用尝试 {tried_accounts} 次 / 候选模型 {tried_models} 个"
     base = f"本网关判断：{hint}；{tried}"
@@ -983,11 +1003,28 @@ def _exhaustion_message(kind: str, last_msg: str, tried_accounts: int,
     client = f"；客户端解释：{info['client_message']}" if info['client_message'] else ''
     code = info['code'] if info['code'] is not None else '未返回'
     status = info['http_status'] or '未记录'
-    return f"{base}{client}；上游 HTTP：{status}；上游 code：{code}；上游原文：{last_msg}"
+    safe = _redact_upstream(last_msg)
+    return (f"{base}{client}；上游 HTTP：{status}；上游 code：{code}；"
+            f"上游原文：{safe}")
 
 
 def _failure_evidence(kind: str, body: str, status: int = 0) -> dict:
-    return {'gateway_kind': kind, 'upstream': upstream_errors.error_info(body, status) if body or status else None}
+    """构造对外可见的失败证据。
+
+    ⚠️ `upstream_errors.error_info()` 的 `raw` 是**上游原文**，它会：
+      1. 随错误响应回给调用方（任意持 Key 的人）
+      2. 经 `acc.last_upstream_error` 持久化到数据库，之后反复出现在
+         别人的响应里
+    上游错误体常回显 `Authorization`，所以这里必须脱敏。
+    需要完整原文排障时看服务端日志（那边保留未脱敏版本）。
+    """
+    if not (body or status):
+        return {'gateway_kind': kind, 'upstream': None}
+    info = dict(upstream_errors.error_info(body, status))
+    for key in ('raw', 'body', 'text', 'content'):
+        if isinstance(info.get(key), str):
+            info[key] = _redact_upstream(info[key], limit=800)
+    return {'gateway_kind': kind, 'upstream': info}
 
 
 def _extract_http_status(msg: str) -> int:

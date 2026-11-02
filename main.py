@@ -26,7 +26,9 @@
 
 环境变量（可选，覆盖默认；部署务必设置）:
   ADMIN_PORT / ADMIN_HOST
-  ADMIN_JWT_SECRET  : 生产务必覆盖为 >=32 字节随机串（默认是弱密钥，会报警）
+  ADMIN_JWT_SECRET  : **必填**（>=32 字节随机串）。未设置时：桌面/安卓本地壳
+                      自动用进程内随机密钥；服务端部署则**拒绝启动**
+                      （避免用公开常量当签名密钥 → 令牌可被离线伪造）
   ADMIN_USERNAME / ADMIN_PASSWORD     : 后台登录凭据（**必填**，无默认值；未配置则登录 503）
   CONVERTER_DESENSITIZE / CONVERTER_LOG : 内嵌网关的脱敏开关与日志路径
 """
@@ -761,9 +763,27 @@ def main() -> None:
                       force=bool(args.restart or args.force))
 
     # 部署安全检查
-    secret = os.getenv("ADMIN_JWT_SECRET", "")
-    if not secret or secret.startswith("workbuddy-admin-jwt-secret-please-change"):
-        _log("⚠️  未设置强 ADMIN_JWT_SECRET，将使用默认弱密钥 —— 部署请务必通过环境变量覆盖！")
+    #
+    # ⚠️ 这里必须**与 admin/config.py 的策略一致**（fail-closed）。
+    # 原来的写法有两处问题：
+    #   1. 判据写的是**上一代**默认值 `workbuddy-admin-jwt-secret-please-change`,
+    #      而当前常量是 `dev-insecure-jwt-secret-change-me` —— 判了个寂寞；
+    #   2. 只告警不阻断，服务照常起来，于是「用公开常量当签名密钥」这个
+    #      可被离线伪造管理员令牌的问题就被一条日志掩盖了（已实测复现）。
+    # 现在：显式配置 / 本地壳随机 / 显式逃生舱 之外，一律拒绝启动。
+    secret = (os.getenv("ADMIN_JWT_SECRET") or "").strip()
+    _local_shell = (os.getenv("WORKBUDDY_DESKTOP") == "1"
+                    or os.getenv("WORKBUDDY_ANDROID") == "1")
+    _insecure_ok = os.getenv("ADMIN_ALLOW_INSECURE_DEFAULT") == "1"
+    if not secret and not _local_shell and not _insecure_ok:
+        _log("✗ ADMIN_JWT_SECRET 未设置，拒绝启动。")
+        _log("  管理员令牌的签名密钥必须由部署者提供，否则任何人都能伪造令牌接管后台。")
+        _log('  生成：python -c "import secrets;print(secrets.token_urlsafe(48))"')
+        _log("  然后写入 .env：ADMIN_JWT_SECRET=<上面的随机串>")
+        _log("  仅隔离测试环境可设 ADMIN_ALLOW_INSECURE_DEFAULT=1 强制继续。")
+        raise SystemExit(2)
+    if not secret and _insecure_ok and not _local_shell:
+        _log("⚠️  ADMIN_ALLOW_INSECURE_DEFAULT=1：使用固定弱密钥，仅限隔离测试环境！")
     if not os.getenv("ADMIN_PASSWORD", "") or not os.getenv("ADMIN_USERNAME", ""):
         _log("⚠️  未配置 ADMIN_USERNAME / ADMIN_PASSWORD，后台登录将返回 503。")
         _log("    请在 .env 中设置这两项后重启（已不再提供 admin/admin123 默认口令）。")

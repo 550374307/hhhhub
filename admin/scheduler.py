@@ -1235,10 +1235,32 @@ def _run_one(s: Schedule, db, now: datetime):
     except Exception as e:  # 单个任务失败不影响调度循环
         s.last_result = json.dumps(
             {"ok": False, "error": _short_error(e)}, ensure_ascii=False)[:2000]
+        # ⚠️ 必须 rollback，否则 session 进入「需要回滚」状态，
+        # 后面那句 `db.commit()` 会抛 PendingRollbackError。
+        # 而这个异常会**逃出 _run_one** —— 调用方 `_loop()` 的
+        # `for s in schedules: _run_one(...)` 因此整体中断，
+        # 该轮剩下的所有任务都不再执行（且不会重试下一轮，
+        # 因为 next_run_at 没被推进，表面上永远是「等下一次」）。
+        #
+        # 实测后果：一个任务抛异常，keepalive / refresh_credits
+        # 就**永久饿死**（6 轮复刻，从未被执行）。
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001 - 回滚失败也不能让调度器停摆
+            logger.exception("调度 %s 回滚失败", getattr(s, "task", "?"))
     s.last_run_at = now
     s.next_run_at = (now + timedelta(minutes=1) if s.task == "keepalive_tokens"
                      and result.get("retry_pending") else next_run_at(s, now))
-    db.commit()
+    # 同上：commit 本身也可能失败（锁等待/写入冲突），
+    # 不能让它把整个调度循环带走。
+    try:
+        db.commit()
+    except Exception:  # noqa: BLE001
+        logger.exception("调度 %s 提交失败", getattr(s, "task", "?"))
+        try:
+            db.rollback()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _loop():
@@ -1253,7 +1275,25 @@ def _loop():
             schedules.sort(key=lambda s: s.task != "run_growth_plan")
             for s in schedules:
                 if s.next_run_at is None or s.next_run_at <= now:
-                    _run_one(s, db, now)
+                    # ⚠️ 逐个隔离：一个任务抛异常不能中断本轮剩下的任务。
+                    # _run_one 内部已经处理了主要异常并 rollback，
+                    # 这里是最后一道保险（例如它的 rollback 本身也失败）。
+                    try:
+                        _run_one(s, db, now)
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "调度任务 %s 抛出未捕获异常，跳过并继续本轮",
+                            getattr(s, "task", "?"))
+                        try:
+                            db.rollback()
+                        except Exception:  # noqa: BLE001
+                            # session 已经不可用：重建一个，避免本轮后续
+                            # 任务全部因同一个坏 session 而失败。
+                            try:
+                                db.close()
+                            except Exception:  # noqa: BLE001
+                                pass
+                            db = SessionLocal()
         except Exception:
             # 数据库短暂不可用（如 MySQL 重启）时静默跳过本轮，下一轮再试。
             # 原先的写法在 `SessionLocal()` 本身抛异常时会引用未赋值的 db，

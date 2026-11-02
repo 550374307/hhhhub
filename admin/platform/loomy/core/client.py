@@ -27,6 +27,8 @@ import re
 import urllib.error
 import urllib.request
 
+from admin.upstream_errors import redact
+
 from . import endpoints
 
 logger = logging.getLogger("admin.platform.loomy.client")
@@ -82,9 +84,12 @@ class UpstreamError(Exception):
         return False
 
     def to_dict(self) -> dict:
+        # ⚠️ `detail` 是上游原文（可能回显 Authorization），而 to_dict()
+        # 的结果会进 API 响应给前端，所以出口必须脱敏。
+        # 完整原文仍保留在对象上，服务端日志按需取。
         return {"message": self.message, "status": self.status,
                 "code": self.code, "kind": self.kind,
-                "detail": self.detail[:300]}
+                "detail": redact(self.detail, 300)}
 
 
 def note_sentinel(realm: str, account_id: int, kind: str, *,

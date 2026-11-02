@@ -79,12 +79,49 @@ class Settings:
     # 保留这个标记供旧集成读取，但不再用它压过后台修改。
     ADMIN_PASSWORD_FROM_ENV = "ADMIN_PASSWORD" in os.environ
     ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
-    # 生产环境务必在 .env 中设置 ADMIN_JWT_SECRET 为 >=32 字节的随机串；
-    # 未设置时回退到开发弱密钥并输出告警。
-    _jwt = os.getenv("ADMIN_JWT_SECRET")
+    # 生产环境务必在 .env 中设置 ADMIN_JWT_SECRET 为 >=32 字节的随机串。
+    #
+    # ## 为什么不能回退到「硬编码弱密钥」（安全问题，已修）
+    #
+    # 原来未设置时回退到常量 `dev-insecure-jwt-secret-change-me`。这个值
+    # 就写在源码里、公开可查，而令牌校验只要求「签名对 + sub == 管理员名」，
+    # 管理员名通常就是 `admin` / `desktop`（登录失败日志还会回显用户名）。
+    # 于是任何人都能**离线伪造管理员令牌**，直接接管后台、导出全部平台
+    # 的 accessToken / refreshToken。已端到端实测复现。
+    #
+    # 现在的策略：
+    #   1. 显式设了 `ADMIN_JWT_SECRET` → 用它（推荐，跨重启保持同一密钥）
+    #   2. 桌面/安卓本地壳 → 进程内随机（每次启动都不同，不需要用户配置，
+    #      也彻底杜绝"公开常量"这条路）
+    #   3. 服务端部署且没配 → **fail-closed**，拒绝启动并给出明确指引。
+    #      静默降级只会把风险藏起来，让部署者永远不知道。
+    _jwt = (os.getenv("ADMIN_JWT_SECRET") or "").strip()
+    _local_shell = (os.getenv("WORKBUDDY_DESKTOP") == "1"
+                    or os.getenv("WORKBUDDY_ANDROID") == "1")
     if not _jwt:
-        _logger.warning("ADMIN_JWT_SECRET 未设置，使用开发弱密钥；生产环境请在 .env 中配置")
-        _jwt = "dev-insecure-jwt-secret-change-me"
+        if _local_shell:
+            # 本地壳：随机密钥。重启后旧令牌失效需要重新登录，这是可接受的
+            # （本机单用户），换来的是绝不可能被离线伪造。
+            import secrets as _secrets
+
+            _jwt = _secrets.token_urlsafe(48)
+            _logger.warning("ADMIN_JWT_SECRET 未设置，已生成本次进程专用的随机密钥"
+                            "（重启后需重新登录）")
+        elif os.getenv("ADMIN_ALLOW_INSECURE_DEFAULT") == "1":
+            # 逃生舱：仅用于隔离测试环境，必须显式打开并留痕
+            _jwt = "dev-insecure-jwt-secret-change-me"
+            _logger.warning("ADMIN_ALLOW_INSECURE_DEFAULT=1，使用固定弱密钥；"
+                            "**仅限隔离测试环境**，切勿用于任何可被访问的部署")
+        else:
+            raise RuntimeError(
+                "ADMIN_JWT_SECRET 未设置：拒绝启动。\n"
+                "  管理员令牌的签名密钥必须由部署者提供，否则任何人都能伪造令牌。\n"
+                "  请生成一个 >=32 字节的随机串写入 .env：\n"
+                "      ADMIN_JWT_SECRET=<随机串>\n"
+                "  生成示例：python -c \"import secrets;print(secrets.token_urlsafe(48))\"\n"
+                "  仅隔离测试环境可设 ADMIN_ALLOW_INSECURE_DEFAULT=1 强制继续。")
+    if len(_jwt) < 16:
+        _logger.warning("ADMIN_JWT_SECRET 长度不足 16 字符，建议使用 >=32 字节的随机串")
     JWT_SECRET = _jwt
     JWT_EXPIRE_HOURS = int(os.getenv("ADMIN_JWT_EXPIRE_HOURS", "24"))
 

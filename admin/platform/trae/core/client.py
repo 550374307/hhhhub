@@ -34,6 +34,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from admin.upstream_errors import redact
+
 from admin.platform.trae.core import fingerprint
 
 # ---------------------------------------------------------------------------

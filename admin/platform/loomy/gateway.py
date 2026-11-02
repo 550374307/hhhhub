@@ -28,6 +28,7 @@ import json
 import logging
 import time
 
+from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, StreamingResponse
 
 from admin.platform import shared
@@ -437,7 +438,35 @@ async def _forward_stream(body: dict, request):
 
     realm = _realm(request)
     db = SessionLocal()
-    key = shared.authenticate(db, request, platform=_public(request))
+    # ⚠️ 关闭必须是幂等的：正常路径由生成器的 finally 关（那时流已结束），
+    # 异常/提前返回路径由下面的 finally 关，两条路径都可能触发。
+    closed = {"done": False}
+
+    def close_db() -> None:
+        if closed["done"]:
+            return
+        closed["done"] = True
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001 - 关闭失败不该掩盖真正的错误
+            pass
+
+    try:
+        # ⚠️ `authenticate()` 必须在 try 内：它会对无效 API Key 抛
+        # HTTPException。原来它写在 try 之前，于是「匿名请求打流式端点」
+        # 这条最容易被触发的路径**必然泄漏一个 Session** ——
+        # 实测 60 次无效 Key 就能把连接池打满，之后普通查询也 30s 超时，
+        # 全站 DB 不可用，只能重启。
+        # （raccoon 的同一处早已用 try/finally 修好，loomy 漏了。）
+        key = shared.authenticate(db, request, platform=_public(request))
+        return await _forward_stream_inner(
+            db, body, request, realm, key, close_db)
+    except BaseException:
+        close_db()
+        raise
+
+
+async def _forward_stream_inner(db, body, request, realm, key, close_db):
     model = str(body.get("model") or "")
     # 分段耗时容器：**必须在调用 client.chat_stream 之前定义**。
     # 它由上游流式读取器填 ttfb/total，再交给 _bill 记账。
@@ -479,7 +508,7 @@ async def _forward_stream(body: dict, request):
             exclude.add(account.id)
 
     if chunks is None:
-        db.close()
+        close_db()
         if last_error is not None:
             return _fail(last_error)
         raise shared.PlatformRejected(
@@ -488,6 +517,37 @@ async def _forward_stream(body: dict, request):
             headers={"Retry-After": "3"})
 
     holder: dict = {}
+    # ⚠️ 流式清理必须幂等，且必须有一个**不依赖生成器 finally** 的兜底。
+    #
+    # 为什么：ASGI spec 2.3 下客户端断连时 uvicorn 会 cancel 任务，
+    # 而 starlette 0.46.2 的 `stream_response` 既没有 `aclose()` 也没有
+    # `finally` —— 生成器的 finally 只能在**垃圾回收时**才跑到。
+    # 结果：客户端提前断开 → 租约不归还 → `MAX_IN_FLIGHT` 被吃满 →
+    # 该账号 `full=True` 永久退出号池，只有重启才恢复。
+    # 实测：3 次「断在响应开始前」即吃满 3/3，等 5 秒 + 强制 gc 仍是 3。
+    #
+    # raccoon 已用 `BackgroundTask(cleanup)` 修好同一问题，这里照做。
+    cleaned = {"done": False}
+
+    def cleanup() -> None:
+        if cleaned["done"]:
+            return
+        cleaned["done"] = True
+        try:
+            shared.release(account)
+            shared.note_success(account)
+            db.commit()
+        except Exception:  # noqa: BLE001
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            _bill(key, account, model, {"usage": holder.get("usage") or {}},
+                  request=request, started=started, stats=stats)
+        except Exception:  # noqa: BLE001 - 记账失败不该影响连接关闭
+            logger.exception("Loomy 流式记账失败 acc=%s", getattr(account, "id", "?"))
+        close_db()
 
     def generator():
         try:
@@ -497,22 +557,13 @@ async def _forward_stream(body: dict, request):
                 {"error": {"message": exc.message, "type": exc.kind}},
                 ensure_ascii=False)).encode()
         finally:
-            try:
-                shared.release(account)
-                shared.note_success(account)
-                db.commit()
-            except Exception:  # noqa: BLE001
-                try:
-                    db.rollback()
-                except Exception:  # noqa: BLE001
-                    pass
-            _bill(key, account, model, {"usage": holder.get("usage") or {}},
-                  request=request, started=started, stats=stats)
-            db.close()
+            cleanup()
 
     return StreamingResponse(
         generator(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        # 兜底：客户端断开 / task 被取消时，Starlette 仍会跑 background
+        background=BackgroundTask(cleanup))
 
 
 def _sse_from_chunks(chunks, model: str, holder: dict):

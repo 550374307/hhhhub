@@ -29,9 +29,11 @@ import json
 import logging
 import time
 
+from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, StreamingResponse
 
 from admin.platform import shared
+from admin.platform.stream_guard import make_cleanup
 from admin.platform.qoder.core import client
 from admin.platform.qoder.services import accounts as qoder_accounts
 from admin.platform.qoder.services import chat as qoder_chat
@@ -381,6 +383,18 @@ async def chat_completions(request):
         started = time.perf_counter()
         usage_holder: dict = {}
 
+        # ⚠️ 清理必须幂等，且要有一个**不依赖生成器 finally** 的兜底：
+        # ASGI spec 2.3 下客户端断连时 uvicorn 会 cancel 任务，
+        # starlette 0.46.2 的 stream_response 既无 aclose() 也无 finally，
+        # 生成器的 finally 只能等 GC。结果是租约不归还 → MAX_IN_FLIGHT
+        # 被吃满 → 该号 full=True 永久退出号池，只有重启才恢复。
+        cleanup = make_cleanup(
+            lambda: (shared.release(account),
+                     _bill(key, account, plan.get("model_name", ""),
+                           usage_holder.get("usage") or {}, request=request,
+                           started=started)),
+            on_error="Qoder 流式清理失败（openai）")
+
         def generator():
             try:
                 yield from qoder_chat.stream_openai(plan, want_usage=want_usage,
@@ -388,14 +402,12 @@ async def chat_completions(request):
             except client.UpstreamError as exc:
                 yield _sse_error(exc)
             finally:
-                shared.release(account)
-                _bill(key, account, plan.get("model_name", ""),
-                      usage_holder.get("usage") or {}, request=request,
-                      started=started)
+                cleanup()
 
         return StreamingResponse(
             generator(), media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            background=BackgroundTask(cleanup))
     finally:
         db.close()
 
@@ -500,18 +512,23 @@ async def messages(request):
 
         usage_holder: dict = {}
 
+        cleanup = make_cleanup(
+            lambda: (shared.release(account),
+                     _bill(key, account, plan.get("model_name", ""),
+                           usage_holder.get("usage") or {}, request=request,
+                           started=started)),
+            on_error="Qoder 流式清理失败（anthropic）")
+
         def generator():
             try:
                 yield from _stream_anthropic(plan, usage_holder)
             finally:
-                shared.release(account)
-                _bill(key, account, plan.get("model_name", ""),
-                      usage_holder.get("usage") or {}, request=request,
-                      started=started)
+                cleanup()
 
         return StreamingResponse(
             generator(), media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            background=BackgroundTask(cleanup))
     finally:
         db.close()
 
@@ -634,18 +651,23 @@ async def responses(request):
 
         usage_holder: dict = {}
 
+        cleanup = make_cleanup(
+            lambda: (shared.release(account),
+                     _bill(key, account, plan.get("model_name", ""),
+                           usage_holder.get("usage") or {}, request=request,
+                           started=started)),
+            on_error="Qoder 流式清理失败（responses）")
+
         def generator():
             try:
                 yield from _stream_responses(plan, usage_holder)
             finally:
-                shared.release(account)
-                _bill(key, account, plan.get("model_name", ""),
-                      usage_holder.get("usage") or {}, request=request,
-                      started=started)
+                cleanup()
 
         return StreamingResponse(
             generator(), media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            background=BackgroundTask(cleanup))
     finally:
         db.close()
 

@@ -8,6 +8,52 @@ import re
 
 _MESSAGES = json.loads((Path(__file__).with_name('data') / 'upstream_error_messages.json').read_text(encoding='utf-8'))
 
+#: 需要打码的凭证形态。顺序有意义：先处理长的、带前缀的形态。
+_REDACT_RULES = (
+    # Authorization 头：必须**整行值**抹掉，不能只抹第一个词。
+    # 反例（实测踩过）：`Authorization: Basic dXNlcjpwYXNz` 若只替换
+    # `\S+`，抹掉的是 `Basic`，后面的 base64 凭据反而露出来了。
+    # 这里吃掉紧跟的 scheme 词 + 其后所有非空白/引号内容。
+    (re.compile(r'(?i)(authorization\s*[:=]\s*)'
+                r'(?:(?:bearer|basic|digest|token)\s+)?'
+                r'[^\s",}\'&]+'),
+     r'\1<redacted>'),
+    # 独立的 scheme + 长串（没有 Authorization 前缀时）
+    (re.compile(r'(?i)\b(bearer|basic|digest)\s+[A-Za-z0-9._~+/=\-]{8,}'), r'\1 <redacted>'),
+    # JSON / query / kv 三种形态的敏感字段
+    (re.compile(r'(?i)\b(access_?token|refresh_?token|id_?token|auth_?token|'
+                r'token|session_?id|session|cookie|set-cookie|api_?key|apikey|'
+                r'secret|password|passwd|pwd|client_secret|code_verifier|'
+                r'auth_?code)"?\s*[:=]\s*"?[^",}\s&]*'),
+     r'\1=<redacted>'),
+    # 裸 JWT（三段式，可能不在任何字段名后面）
+    (re.compile(r'eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]*'), '<jwt>'),
+    # 常见的长随机串前缀（sk- / wb- / ghp_ …）
+    (re.compile(r'\b(sk|wb|ghp|gho|ghs|xox[baprs])[-_][A-Za-z0-9_\-]{16,}'), r'\1-<redacted>'),
+)
+
+
+def redact(text: str, limit: int = 0) -> str:
+    """抹掉文本里可能承载凭证的片段，并可截断。
+
+    ## 用途
+
+    上游的错误体常常**回显请求头**（`Authorization: Bearer <token>`），
+    或者带上 `access_token=...`。这些文本进日志没问题，但要回到响应体、
+    或写进之后可能被别人看到的数据库字段，就必须先脱敏。
+
+    各平台的 `UpstreamError.detail` 约定是「只进日志」，但实际有若干地方
+    把它塞进了 `to_dict()` 交给前端（loomy/qoder/trae/raccoon 都有）。
+    所以脱敏放在转换出口，而不是指望每个调用点都记得处理。
+    """
+    if not text:
+        return ''
+    out = str(text)
+    for pattern, repl in _REDACT_RULES:
+        out = pattern.sub(repl, out)
+    return out[:limit] if limit else out
+
+
 
 class UpstreamError(RuntimeError):
     def __init__(self, context: str, status: int, body: str):

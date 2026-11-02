@@ -10071,6 +10071,19 @@ function modelHealthCell(model) {
     ${probe ? `<small data-tooltip="最近一次检测" data-tooltip-description="${esc(fmtTime(probe.observed_at))}">检测：${ms(probe.ttft_ms)} · 响应头 ${ms(probe.headers_ms)}</small><small data-tooltip="输出间隔波动" data-tooltip-description="增量到达间隔的标准差，包含模型生成与网络传输，不是纯网络抖动。">输出间隔波动 ${ms(probe.inter_delta_jitter_ms)}</small>` : ''}</div>`;
 }
 let _modelDisplay = {show_multiplier:true, show_busy:true, official_only:true};
+/* ⚠️ 下面这些「防重入 / 节流」标志必须在**使用前显式声明**。
+ * 之前它们只被赋值（隐式全局），或者被读取时压根不存在 ——
+ * 于是 `if (_modelBusyLoading || ...) return;` 一读就抛 ReferenceError，
+ * 异常又被上层 catch/SSE 回调吞掉，表现是「功能静默失效、用户零感知」：
+ *   · _modelBusyLoading 未声明 → 繁忙度 73 条数据全丢，全部显示「未知」
+ *   · _logUsageBusy     未声明 → 日志实时刷新每次必抛，表格永不刷新
+ * `let` 在声明语句执行前处于 TDZ，所以必须放在首次调用之前（这里在函数定义区
+ * 之前，脚本顶层执行即可）。 */
+let _modelBusyLoading = false;   /* 繁忙度拉取防重入（_modelBusy 已在 2542 行声明） */
+let _logUsageBusy = false;       /* 用量日志刷新防重入 */
+let _logUsageRevision = 0;       /* 日志变更版本号（SSE 增量判断） */
+let _logUsageDirty = false;      /* 有未应用的变更 */
+let _logUsageAt = 0;             /* 上次刷新时间戳 */
 function applyModelDisplay(options) {
   _modelDisplay = {..._modelDisplay, ...(options || {})};
   $('#modelShowMultiplier').checked = _modelDisplay.show_multiplier !== false;
@@ -14057,6 +14070,34 @@ function geSelectAll(on) {
   const list = _geModels.filter(m => !term || (m.model_id || "").toLowerCase().includes(term));
   for (const m of list) { if (on) _geSelected.add(m.model_id); else _geSelected.delete(m.model_id); }
   renderGeModels();
+}
+
+/* 分组编辑器里「同一 model_id 出现多行」是真实存在的：
+ *
+ *   workbuddy 平台有 9 个 model_id 各存了两条（realm=cn 和 realm=global），
+ *   例如 hy3 / glm-5.3 / deepseek-v4.1-flash。
+ *
+ * 而 `_geSelected` 是 `Set<model_id>`，`model_group_items` 表也只存 model_id
+ * （没有 realm 列）。于是这两行共享同一个勾选状态：
+ *   · 勾第一行 → 两行同时变选中
+ *   · 全选 9 项实际只往 Set 里加 9 个（重复的挤在同一个键上）
+ *   · 用户数了 18 行却只有 9 个选中，体感是「全选没生效」
+ *
+ * 彻底修需要后端在分组里带上 realm（会动表结构和语义，见
+ * _audit/full-C-protocol-frontend.md 的 P1-4「realm 语义待决策」）。
+ * 这里先做**可见性修复**：把重复的 model_id 明确标出来，让用户知道
+ * 这两行是同一个模型的两个 realm，勾一个等于勾两个 —— 而不是静默地
+ * 让计数对不上。
+ */
+function geRealmDupCount() {
+  const seen = new Map();
+  for (const m of _geModels) {
+    const k = m.model_id || "";
+    seen.set(k, (seen.get(k) || 0) + 1);
+  }
+  let dup = 0;
+  for (const n of seen.values()) if (n > 1) dup += 1;
+  return dup;
 }
 
 async function saveGroup() {

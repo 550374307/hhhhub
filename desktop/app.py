@@ -17,7 +17,7 @@ from pathlib import Path
 
 import webbrowser
 
-from desktop.common import ROOT, VERSION, atomic_json, data_dir
+from desktop.common import RELEASE, ROOT, atomic_json, data_dir
 from desktop.runtime import configure_node, ensure_node, ensure_webview2
 from desktop.tray import TrayController, available as tray_available
 from desktop.updates import UpdateService
@@ -291,7 +291,7 @@ async function showDiagnostic(){try{const r=await pywebview.api.startup_diagnost
 function copyReport(){const r=document.getElementById('report');r.select();document.execCommand('copy')}
 function downloadReport(){const u=URL.createObjectURL(new Blob([document.getElementById('report').value],{type:'text/plain;charset=utf-8'}));const a=document.createElement('a');a.href=u;a.download='miraihub-startup-diagnostic.txt';a.click();setTimeout(()=>URL.revokeObjectURL(u),1000)}
 setInterval(async()=>{if(reading||!window.pywebview?.api)return;reading=true;try{const s=await pywebview.api.startup_status();document.getElementById('status').textContent=s.message;document.getElementById('diagnosticButton').hidden=!(s.failed||Date.now()-began>30000);document.getElementById('bar').hidden=s.failed}catch(e){}finally{reading=false}},1000);
-</script></html>""".replace("__VERSION__", VERSION)
+</script></html>""".replace("__VERSION__", RELEASE)
 
 
 class Bridge:
@@ -412,7 +412,7 @@ class DesktopAPI:
     def startup_diagnostic(self):
         from admin.request_metrics import safe_error_text
         import platform
-        report = f"MiraiHub {VERSION} 启动诊断\n系统：{platform.platform()}\n阶段：{self.message}\n环境：{self.runtime_message}\n"
+        report = f"MiraiHub {RELEASE} 启动诊断\n系统：{platform.platform()}\n阶段：{self.message}\n环境：{self.runtime_message}\n"
         process = self.process
         report += f"服务进程：{process.poll() if process else '未启动'}（None 表示运行中）\n"
         log = self.base / "logs/backend.log"
@@ -446,7 +446,7 @@ class DesktopAPI:
             if not result.get("available") or not latest or self.closing.is_set():
                 return
             choice = ctypes.windll.user32.MessageBoxW(
-                None, f"发现新版本 {latest['tag']}（当前 v{VERSION}）。\n\n"
+                None, f"发现新版本 {latest['tag']}（当前 v{RELEASE}）。\n\n"
                 "是否立即更新？\n选择“是”将下载、校验并重启客户端；选择“否”暂不更新。",
                 "MiraiHub · 版本更新", 0x00010024)
             if choice != 6 or self.closing.is_set():  # IDYES
@@ -664,7 +664,7 @@ class DesktopAPI:
                 logging.exception("Failed to restore window")
         try:
             self.window = webview.create_window(
-                f"MiraiHub · v{VERSION}", html=SPLASH, js_api=Bridge(self),
+                f"MiraiHub · v{RELEASE}", html=SPLASH, js_api=Bridge(self),
                 width=1280, height=860, min_size=(900, 600),
                 background_color="#f5f6f8", text_select=True, frameless=True, easy_drag=False)
         except Exception as exc:
@@ -778,14 +778,14 @@ class DesktopAPI:
         return {"ok": True}
 
     def _smoke_test(self):
-        result = {"ok": False, "version": VERSION, "port": self.port}
+        result = {"ok": False, "version": RELEASE, "port": self.port}
         try:
             for _ in range(60):
                 if self.closing.wait(.5):
                     break
                 ready = self.window.evaluate_js("document.getElementById('app') && "
                     "!document.getElementById('app').classList.contains('hidden') && "
-                    "document.getElementById('appVersion').textContent.includes('v" + VERSION + "')")
+                    "document.getElementById('appVersion').textContent.includes('v" + RELEASE + "')")
                 if ready:
                     result.update(ok=True, title=self.window.evaluate_js("document.title"),
                                   footer=self.window.evaluate_js("document.getElementById('appVersion').textContent"))
@@ -922,7 +922,7 @@ def run(tray_mode: bool = False):
 
         _boot("run():tray_mode=%s" % tray_mode)
         if tray_mode:
-            tray = TrayController(api, ROOT, VERSION)
+            tray = TrayController(api, ROOT, RELEASE)
             api.tray = tray
             started = tray.start()
             _boot("tray.start()=%s" % started)
@@ -934,7 +934,7 @@ def run(tray_mode: bool = False):
 
         if not tray_mode:
             # Original path: window owns everything, closing it exits the app.
-            window = webview.create_window(f"MiraiHub · v{VERSION}", html=SPLASH, js_api=Bridge(api),
+            window = webview.create_window(f"MiraiHub · v{RELEASE}", html=SPLASH, js_api=Bridge(api),
                                           width=1280, height=860, min_size=(900, 600),
                                           background_color="#f5f6f8", text_select=True, frameless=True, easy_drag=False)
             api.window = window
@@ -962,7 +962,7 @@ def run(tray_mode: bool = False):
         # 主窗口在托盘模式下也要能打开 —— 和窗口模式同一个 SPLASH 页面，
         # 由 Bridge 驱动启动进度。
         window = webview.create_window(
-            f"MiraiHub · v{VERSION}", html=SPLASH, js_api=Bridge(api),
+            f"MiraiHub · v{RELEASE}", html=SPLASH, js_api=Bridge(api),
             width=1280, height=860, min_size=(900, 600),
             background_color="#f5f6f8", text_select=True, frameless=True,
             easy_drag=False)

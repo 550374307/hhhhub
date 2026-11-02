@@ -794,9 +794,13 @@ async def _run_platform(dispatch, request, path: str, platform_id: str):
         response = await dispatch(request, path)
     except Exception as exc:  # noqa: BLE001 - 平台内部异常不该变成 500 裸奔
         logger.exception("平台 %s 处理 %s 失败", platform_id, path)
+        # ⚠️ 不能把 `{exc}` 回给调用方：这是 /v1 主路径，收件人是**任意持
+        # API Key 的人**（不需要管理员）。异常里可能带账号凭证（SQLAlchemy
+        # 的绑定参数、上游回显的 Authorization），一旦回出去就是泄漏。
+        # 只给异常类型，排查靠上面那行 logger.exception 的完整 traceback。
         return JSONResponse(
             status_code=502,
-            content={"error": {"message": f"上游平台异常：{exc}",
+            content={"error": {"message": f"上游平台异常（{type(exc).__name__}）",
                                "type": "server_error",
                                "code": "platform_error"}})
     if response is None:

@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from admin.models import Account, CreditEvent, SystemSetting
 from admin.security import require_admin
 from admin.routers.releases import service
-from desktop.common import VERSION, RELEASES_URL
+from desktop.common import RELEASE, RELEASES_URL
 
 logger = logging.getLogger("admin.maintenance")
 
@@ -30,16 +30,32 @@ router = APIRouter(prefix="/api/maintenance", tags=["maintenance"], dependencies
 
 @router.get("/update")
 def update_info(db: Session = Depends(get_db)):
-    from packaging.version import Version, InvalidVersion
+    r"""检查更新（网页控制台用）。
+
+    ⚠️ 必须与 `desktop/updates.py` 用**同一套**版本比较逻辑。
+    原来这里自己写了一套：
+      * `Version(tag)` —— `-fixN` 不是合法 PEP 440，`Version("1.0.2-fix3")`
+        直接抛 InvalidVersion，被 except 吞掉；
+      * 再叠一层 `re.fullmatch(r"[vV]?\d+\.\d+\.\d+")` —— 连纯 `-fixN`
+        也被正则挡掉。
+    结果是**所有修复版都被丢弃**，网页控制台永远显示「已是最新」，
+    而桌面端能正常升级 —— 两条路径的口径分裂（已实测：真实接口返回
+    `version:1.0.2, available:false, latest:null`，而 `newer()` 对
+    同一组 tag 返回 True）。
+
+    现在统一走 `parse_version_tag` / `newer`，与桌面端完全一致。
+    """
+    from desktop.updates import parse_version_tag
+
     snapshot = service().check()
     candidates = []
     for release in snapshot.get("releases", []):
-        try:
-            version = Version(release["tag"].lstrip("vV"))
-            if not version.is_prerelease and re.fullmatch(r"[vV]?\d+\.\d+\.\d+", release["tag"]):
-                candidates.append((version, release))
-        except (InvalidVersion, KeyError, TypeError):
+        tag = release.get("tag") or ""
+        parsed = parse_version_tag(tag)
+        if parsed is None:
             continue
+        candidates.append((parsed, release))
+    # 排序键与 desktop/updates.py 一致：((major,minor,patch), fix)
     latest = max(candidates, key=lambda item: item[0], default=(None, None))[1]
     tag = latest["tag"] if latest else None
     commands = None
@@ -57,9 +73,15 @@ def update_info(db: Session = Depends(get_db)):
     # 备份位置直接并进来 —— 维护页只打这一个接口就能渲染完整面板，
     # 不用再额外请求 /backup/info（多一次往返，字段也容易漂移）。
     location = _backup_location(db)
+
+    def _is_newer(other_tag: str) -> bool:
+        from desktop.updates import newer
+
+        return newer(other_tag, RELEASE)
+
     return {**location,
-            "version": VERSION, "latest": {k: latest.get(k) for k in ("tag", "name", "url", "date")} if latest else None,
-            "available": bool(latest and Version(tag.lstrip("vV")) > Version(VERSION)),
+            "version": RELEASE, "latest": {k: latest.get(k) for k in ("tag", "name", "url", "date")} if latest else None,
+            "available": bool(tag and _is_newer(tag)),
             "error": snapshot.get("error", ""), "releases_url": RELEASES_URL,
             "database": engine.dialect.name, "backup_supported": engine.dialect.name == "sqlite",
             "commands": commands, "commands_cn": commands_cn,

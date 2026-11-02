@@ -34,11 +34,13 @@ import time
 from fastapi import Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
+from starlette.background import BackgroundTask
 
 from admin.client_ip import request_ip
 from admin.db import SessionLocal
 from admin.platform import registry
 from admin.platform.registry import get as get_platform
+from admin.platform.stream_guard import make_cleanup
 from admin.pool import POOL
 from admin.security import check_quota, get_key_row
 from admin.platform.trae.core import catalog, client, protocol
@@ -893,17 +895,26 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
             use_case=USE_CASE["/v1/chat/completions"])
         holder_box["h"] = holder
 
+        # 幂等清理 + BackgroundTask 兜底：ASGI spec 2.3 下客户端断连时
+        # starlette 的 stream_response 不执行生成器 finally（只等 GC），
+        # 于是 _release 不归还名额、_bill 不记账。
+        # 实测：3 次断连即吃满 MAX_IN_FLIGHT，该号永久退出号池。
+        cleanup = make_cleanup(
+            lambda: (_release(holder),
+                     _bill(key, account, model, holder, ip, ttfb, attempted,
+                           "/v1/chat/completions", started=started)),
+            on_error="Trae 流式清理失败（chat）")
+
         def generator():
             try:
                 yield from _tail(holder, first, stream=True)
             finally:
-                _release(holder)
-                _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/chat/completions", started=started)
+                cleanup()
 
         return StreamingResponse(generator(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
-                                          "X-Accel-Buffering": "no"})
+                                          "X-Accel-Buffering": "no"},
+                                 background=BackgroundTask(cleanup))
     finally:
         db.close()
 
@@ -967,17 +978,22 @@ async def responses(request: Request) -> StreamingResponse | JSONResponse:
             db, realm=realm, model=model, body=body, key=key,
             render=render_stream, sticky_key=sticky, use_case=USE_CASE["/v1/responses"])
 
+        cleanup = make_cleanup(
+            lambda: (_release(holder),
+                     _bill(key, account, model, holder, ip, ttfb, attempted,
+                           "/v1/responses", started=started)),
+            on_error="Trae 流式清理失败（responses）")
+
         def generator():
             try:
                 yield from _tail(holder, first, stream=True)
             finally:
-                _release(holder)
-                _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/responses", started=started)
+                cleanup()
 
         return StreamingResponse(generator(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
-                                          "X-Accel-Buffering": "no"})
+                                          "X-Accel-Buffering": "no"},
+                                 background=BackgroundTask(cleanup))
     finally:
         db.close()
 
@@ -1039,17 +1055,22 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
             db, realm=realm, model=model, body=body, key=key,
             render=render_stream, sticky_key=sticky, use_case=USE_CASE["/v1/messages"])
 
+        cleanup = make_cleanup(
+            lambda: (_release(holder),
+                     _bill(key, account, model, holder, ip, ttfb, attempted,
+                           "/v1/messages", started=started)),
+            on_error="Trae 流式清理失败（messages）")
+
         def generator():
             try:
                 yield from _tail(holder, first, stream=True)
             finally:
-                _release(holder)
-                _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/messages", started=started)
+                cleanup()
 
         return StreamingResponse(generator(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache",
-                                          "X-Accel-Buffering": "no"})
+                                          "X-Accel-Buffering": "no"},
+                                 background=BackgroundTask(cleanup))
     finally:
         db.close()
 
@@ -1118,7 +1139,17 @@ async def list_models(request: Request) -> JSONResponse:
                 rows = client.fetch_model_list(creds, realm)
                 catalog.note_live_rows(realm, rows)
                 live_names = {str(r.get("name") or "") for r in rows}
-                _release({"uid": account.uid})
+                # ⚠️ 这里**不能** `_release({"uid": account.uid})`。
+                #
+                # `trae_pool.select(mark_picked=False)` 只是不写"最近选择"
+                # 标记，**从未 acquire 在途名额**（acquire 在真正的对话
+                # 路径里做）。而在途计数是纯减 1 的：
+                #   InFlight.release -> cur = counts.get(uid, 0); counts[uid] = cur-1
+                # 于是每拉一次 `/v1/models` 就无中生有地减掉别的请求的一个
+                # 名额 —— 实测占满 3 个真实在途后拉 10 次模型清单，
+                # 闸门以为只有 0 在途，实际并发被放到 13。
+                # 这会让 MAX_IN_FLIGHT 彻底失效，号被压垮。
+                pass
         except client.UpstreamError as exc:
             note = "上游模型清单获取失败（%s），仅返回目录" % exc.message
         except Exception as exc:  # noqa: BLE001

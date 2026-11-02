@@ -152,6 +152,14 @@ def prepare() -> None:
     if staging.exists():
         shutil.rmtree(staging)
     staging.mkdir(parents=True)
+    # ⚠️ 只拷 `*.py` 是不够的：平台目录里还有**运行时数据文件**。
+    # 实测漏了 `admin/platform/trae/data/{catalog_cn,catalog_intl}.json`
+    # （约 20 KB）—— 后果不是崩溃，而是**静默退化**：
+    #   catalog.reload() 返回 0 个别名（正常 115 个），
+    #   entry('deepseek-v4-flash') 直接 None，
+    #   于是 Trae 的模型名解析全丢，大小写不符的请求一律 4023。
+    # 而且构建和 check_runtime 都不报错（加载器用 except Exception 兜住了），
+    # 属于「源码能跑、只有 APK 坏」的典型。
     for path in (ROOT / "admin").rglob("*.py"):
         relative = path.relative_to(ROOT)
         if path.name in ("app_source.py",):
@@ -159,6 +167,28 @@ def prepare() -> None:
         target = staging / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, target)
+
+    # 非 .py 的运行时资源（JSON 数据、模板等）：按平台目录整体补齐。
+    # 只挑 `data/` 子树，避免把 __pycache__ / 测试产物带进 APK。
+    # ⚠️ 跳过顶层的 `admin/data` —— 它下面会由 copytree 单独处理，
+    # 这里再拷一次会让那次 copytree 撞 FileExistsError（实测踩过）。
+    top_level_data = (ROOT / "admin" / "data").resolve()
+    copied_data = []
+    for data_dir in (ROOT / "admin").rglob("data"):
+        if not data_dir.is_dir() or "__pycache__" in data_dir.parts:
+            continue
+        if data_dir.resolve() == top_level_data:
+            continue
+        for path in data_dir.rglob("*"):
+            if not path.is_file() or path.suffix == ".pyc" or "__pycache__" in path.parts:
+                continue
+            relative = path.relative_to(ROOT)
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            copied_data.append(relative.as_posix())
+    if copied_data:
+        print(f"Bundled {len(copied_data)} runtime data file(s) into APK staging")
     for name in ("upstream_compat.py", "anthropic_adapter.py", "responses_adapter.py",
                  "responses_projection.py", "desensitize.py", "repository_instructions.py", "wb_install.py", "converter.py", "model_metadata.py"):
         shutil.copy2(ROOT / name, staging / name)

@@ -1151,7 +1151,11 @@ def import_local(body: ImportLocalIn, _: bool = Depends(require_admin), db: Sess
                 updated += 1
                 continue
             except Exception as exc:  # noqa: BLE001 - 更新失败按错误报，不新建
-                errors.append(f"{name}: 更新既有账号失败（{exc}）")
+                # ⚠️ 不能把 `{exc}` 直接回给前端：SQLAlchemy 的异常字符串带
+                # **完整绑定参数**（`[parameters: (..., '{"accessToken": "eyJ..."}')]`），
+                # 而这里绑的正是账号凭证 —— 实测会把真实 JWT 写进响应体。
+                # 只回异常类型，详情留在服务端日志。
+                errors.append(f"{name}: 更新既有账号失败（{type(exc).__name__}）")
                 continue
         acc = Account()
         # 这是**本机客户端自己写的**登录态，可信度天然高于网页上传，

@@ -6,6 +6,8 @@ import logging
 import urllib.error
 import urllib.request
 
+from admin.upstream_errors import redact
+
 from . import endpoints
 from .cosy import build_auth_headers, encode_body
 
@@ -71,9 +73,10 @@ class UpstreamError(Exception):
         return self.code == "10605"
 
     def to_dict(self) -> dict:
+        # detail 是上游原文，可能回显 Authorization；to_dict() 会进 API 响应
         return {"message": self.message, "status": self.status,
                 "code": self.code, "kind": self.kind,
-                "detail": self.detail[:400]}
+                "detail": redact(self.detail, 400)}
 
 
 def _open(url: str, data: bytes | None, headers: dict,

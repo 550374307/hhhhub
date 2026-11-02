@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 altgraph==0.17.5
 annotated-doc==0.0.5
 annotated-types==0.8.0

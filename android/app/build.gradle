@@ -4,10 +4,40 @@ plugins {
 }
 
 def metadata = new groovy.json.JsonSlurper().parse(file('../../desktop/version.json'))
-// versionCode 必须是纯数字递增值，用基础版本（三段式）换算；
 // versionName 是用户看到的版本，用 release（可带 -fixN）。
-def versionParts = metadata.version.tokenize('.').collect { it as int }
 def displayVersion = metadata.release ?: metadata.version
+
+// ⚠️ versionCode 必须能区分 `-fixN`，否则 Android 会拒绝覆盖安装。
+//
+// Android 只认 versionCode 递增：同 code 的 APK 装不上同 code 的新包
+// （报 "App not installed: package already exists" 或直接静默失败）。
+// 而基础版本在三段式里是**不变**的 —— 1.0.2 / 1.0.2-fix1 / 1.0.2-fix3
+// 全是同一个 1.0.2，所以下面这种只按三段算的写法会让所有修复版
+// 共用同一个 versionCode：
+//
+//     versionParts[0]*1000000 + versionParts[1]*1000 + versionParts[2]
+//     -> 1.0.2 / -fix1 / -fix3 / -fix9 全部 = 1000002   （实测）
+//
+// 编码方案（总量仍在 int32 内）：
+//     major*100000000  +  minor*1000000  +  patch*10000  +  fix
+//   例如 1.0.2      -> 100020000 000  -> 100020000
+//        1.0.2-fix3 -> 100020000 + 3 -> 100020003
+//        1.0.3      -> 100030000
+// 这样：fix 递增能覆盖安装；上游升 patch 时数值跨度足够，不会撞车。
+def versionParts = metadata.version.tokenize('.').collect { it as int }
+if (versionParts.size() != 3) {
+    throw new GradleException("desktop/version.json 的 version 必须是三段数字，实际: ${metadata.version}")
+}
+// 从 release 里取 -fixN 尾号；没有 fix 后缀则为 0
+def fixMatch = (displayVersion =~ /-fix(\d+)$/)
+def fixNumber = fixMatch.find() ? (fixMatch.group(1) as int) : 0
+if (fixNumber > 9999) {
+    throw new GradleException("fix 号过大（${fixNumber}），versionCode 编码放不下")
+}
+def computedVersionCode = versionParts[0] * 100000000L +
+                          versionParts[1] * 1000000L +
+                          versionParts[2] * 10000L +
+                          fixNumber
 android {
     namespace 'io.github.xiaofan6ya.workbuddy2api'
     compileSdk 35
@@ -16,7 +46,7 @@ android {
         applicationId 'io.github.xiaofan6ya.workbuddy2api'
         minSdk 24
         targetSdk 35
-        versionCode versionParts[0] * 1000000 + versionParts[1] * 1000 + versionParts[2]
+        versionCode computedVersionCode
         versionName displayVersion
         ndk { abiFilters 'arm64-v8a' }
     }

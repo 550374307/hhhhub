@@ -164,13 +164,30 @@ def main():
                 env["JAVA_TOOL_OPTIONS"] = (env.get("JAVA_TOOL_OPTIONS", "") + f' -Djdk.net.unixdomain.tmpdir="{fallback}"').strip()
             if version != current:
                 metadata["version"] = version
+                # ⚠️ `release` 必须同步改：它是产物文件名、界面展示版本、
+                # 自动更新比较基准的唯一来源（见 desktop/common.py:RELEASE）。
+                # 只改 `version` 会写出自相矛盾的 version.json —— 例如
+                # version=1.0.3 而 release=1.0.2-fix3，于是产物仍叫
+                # `...-1.0.2-fix3-...`，而按 version 拼的路径又找不到文件。
+                # 原 release 若带 `-fixN`，保留后缀、换成新基础版本。
+                old_release = str(metadata.get("release") or "")
+                suffix = ""
+                if "-fix" in old_release:
+                    suffix = "-fix" + old_release.split("-fix", 1)[1]
+                metadata["release"] = version + suffix
                 METADATA.write_text(json.dumps(metadata, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            (ROOT / f"dist/build-{version}.json").unlink(missing_ok=True)
+            # ⚠️ 产物名跟 `release` 走，不是 `version`。
+            # `desktop/miraihub.spec` 的 `name` 与 `build_android.py` 的输出
+            # 都用 release（可带 -fixN），这里必须同口径，否则 PyInstaller
+            # 成功之后读文件会抛 FileNotFoundError。
+            # （同一个坑在 build_desktop.py 修过一次，这里是原样复发。）
+            release = str(metadata.get("release") or version)
+            (ROOT / f"dist/build-{release}.json").unlink(missing_ok=True)
             for command in commands:
                 run(command, log, env)
-            artifacts = [ROOT / f"dist/miraihub-{version}-windows-x64.exe",
-                         ROOT / f"dist/android/miraihub-{version}-android-arm64.apk"]
-            manifest = {"version": version, "files": []}
+            artifacts = [ROOT / f"dist/miraihub-{release}-windows-x64.exe",
+                         ROOT / f"dist/android/miraihub-{release}-android-arm64.apk"]
+            manifest = {"version": release, "files": []}
             for path in artifacts:
                 hasher = hashlib.sha256()
                 with path.open("rb") as file:
