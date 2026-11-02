@@ -152,23 +152,37 @@ class UpdateService:
                         continue
                     tag = str(row.get("tag_name", ""))
                     assets = {a["name"]: a for a in row.get("assets", [])}
-                    # ⚠️ 资产名里的版本号取自 **desktop/version.json**（构建时），
-                    # 不是 tag。修复版 tag 是 `v1.0.2-fix1` 而产物仍叫
-                    # `miraihub-1.0.2-windows-x64.exe`。
-                    # 早期这里用 tag 拼文件名，于是修复版永远匹配不到资产、
-                    # 被判成「不可安装」，更新提示直接消失 —— 而且不报错。
-                    # 现在按解析出的基础版本号拼，并回退到「按模式匹配」。
+                    # ⚠️ 资产名里的版本号与 tag **不一定相同**，必须多路尝试。
+                    #
+                    # 历史上踩过两次：
+                    #   1. 早期产物名取自 version.json 的 `version`（1.0.2），
+                    #      而 tag 是 v1.0.2-fix1 → 用 tag 拼永远对不上；
+                    #   2. 现在产物名改用 `release`（1.0.2-fix3），
+                    #      与 tag 一致，但用「基础版本号」拼又对不上了。
+                    #
+                    # 所以这里按优先级依次试：完整 tag 名 → 基础版本名 → 唯一 .exe 兜底。
+                    # 三条都失败才算「这个 release 没产物」。
+                    candidates_names = []
+                    tag_text = tag.lstrip("vV")
+                    if tag_text:
+                        candidates_names.append(self.asset_pattern.format(version=tag_text))
                     parsed = parse_version_tag(tag)
-                    base_text = ".".join(str(x) for x in parsed[0]) if parsed else tag.lstrip("vV")
-                    filename = self.asset_pattern.format(version=base_text)
-                    asset = assets.get(filename)
+                    if parsed:
+                        base_text = ".".join(str(x) for x in parsed[0])
+                        if base_text and base_text != tag_text:
+                            candidates_names.append(self.asset_pattern.format(version=base_text))
+                    filename = ""
+                    asset = None
+                    for cand in candidates_names:
+                        if cand in assets:
+                            filename, asset = cand, assets[cand]
+                            break
                     if asset is None:
-                        # 兜底：同 tag 下唯一一个 .exe 也算（容忍命名漂移）
+                        # 兜底：同 tag 下唯一一个 .exe 也算（容忍任何命名漂移）
                         exes = [n for n in assets
                                 if n.lower().endswith(".exe") and not n.lower().endswith(".sha256.exe")]
                         if len(exes) == 1:
-                            filename = exes[0]
-                            asset = assets[filename]
+                            filename, asset = exes[0], assets[exes[0]]
                     checksum = assets.get(filename + ".sha256") if filename else None
                     digest = (asset or {}).get("digest", "") or ""
                     releases.append({"id": row["id"], "tag": tag, "name": row.get("name") or tag,
