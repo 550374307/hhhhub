@@ -1,31 +1,134 @@
 name: Build Windows desktop
+
+# 触发方式
+#   1) 推 tag（v1.0.2 / v1.0.2-fix1 / v1.0.2-fix2 …）→ 构建 + 发 release
+#   2) 手动 workflow_dispatch → 只产出 artifact，不发 release
 on:
+  push:
+    tags:
+      - 'v*'
   workflow_dispatch:
+
+# 默认最小权限；只有负责发 release 的那个 job 才提升到 write。
+# pip install / PyInstaller 会执行仓库内代码，不该让它们握着可写 token。
 permissions:
   contents: read
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
           architecture: x64
           cache: pip
           cache-dependency-path: requirements-desktop-lock.txt
+
+      # ---------------------------------------------------------------
+      # 版本一致性校验
+      #
+      # tag 必须是 `v<base>` 或 `v<base>-fix<N>`，其中 <base> 等于
+      # desktop/version.json 里的 version。允许 -fixN 是因为本仓库会在
+      # 上游版本之上带自己的修复（见 README 的「本 fork 的改动」），
+      # 但 base 必须跟着上游走 —— 否则版本号就失去对照意义了。
+      # ---------------------------------------------------------------
       - name: Verify release tag matches desktop version
         if: startsWith(github.ref, 'refs/tags/')
         shell: pwsh
         run: |
           $version = (Get-Content desktop/version.json | ConvertFrom-Json).version
-          if ($env:GITHUB_REF_NAME -ne "v$version") { throw 'Tag must match desktop/version.json' }
+          $tag = $env:GITHUB_REF_NAME
+          $expected = "v$version"
+          # ⚠️ 必须用大小写敏感比较（-ceq / -cmatch）。
+          # PowerShell 的 -eq / -match 默认**忽略大小写**，实测
+          # `V1.0.2` 能通过 -eq、`v1.0.2-FIX1` 能通过 -match —— 于是
+          # 大小写写错的 tag 也会被放行，产出与预期版本不一致的 release。
+          if ($tag -ceq $expected) {
+            Write-Host "Tag '$tag' matches desktop/version.json"
+          } elseif ($tag -cmatch "^$([regex]::Escape($expected))-fix([1-9][0-9]*)$") {
+            Write-Host "Tag '$tag' is a fork fix build on top of $expected (fix #$($Matches[1]))"
+          } else {
+            throw "Tag '$tag' must be '$expected' or '$expected-fixN' (N>=1)"
+          }
+
       - run: python -m pip install -r requirements-desktop-lock.txt
       - run: python scripts/check_runtime.py
-      - run: python scripts/build_desktop.py
+
+      - name: Build desktop EXE
+        run: python scripts/build_desktop.py
+
+      - name: List dist
+        shell: pwsh
+        run: Get-ChildItem dist | Select-Object Name, Length
+
       - uses: actions/upload-artifact@v4
         with:
-          name: wb2api-windows-x64
+          name: miraihub-windows-x64
+          if-no-files-found: error
           path: |
             dist/*.exe
             dist/*.sha256
+
+  # -------------------------------------------------------------------
+  # 发布 job：唯一持有 contents:write 的地方。
+  #
+  # 为什么拆开：构建阶段要 `pip install` + 跑 PyInstaller，都会执行
+  # 仓库内的 Python 代码。让这些步骤握着一个可写 token 是没有必要的
+  # 权限放大 —— 一旦上游依赖被投毒，就能直接改 release。
+  # -------------------------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: miraihub-windows-x64
+          path: dist
+
+      - name: List dist
+        run: ls -la dist
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          notes="自动构建：${TAG}
+
+          基于上游 MiraiHub 版本，包含本 fork 的小浣熊（raccoon）平台接入。"
+          # 探测同名 release 是否存在。
+          # gh 对 404 / 403 / 网络失败一律返回 1，不能只看退出码就断定
+          # 「不存在」—— 那会把「没权限」误判成「没有 release」。
+          if gh release view "$TAG" --json tagName >/dev/null 2>&1; then
+            echo "Release $TAG exists, deleting for rebuild"
+            gh release delete "$TAG" --yes --cleanup-tag=false
+          else
+            echo "No existing release for $TAG; will create"
+          fi
+          gh release create "$TAG" \
+            --title "MiraiHub $TAG" \
+            --notes "$notes" \
+            --verify-tag \
+            dist/*.exe dist/*.sha256
+
+      - name: Release summary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Release $TAG published"
+            gh release view "$TAG" --json assets --jq '.assets[] | "- \(.name) (\(.size) bytes)"'
+          } >> "$GITHUB_STEP_SUMMARY"

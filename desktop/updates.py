@@ -12,13 +12,66 @@ from packaging.version import InvalidVersion, Version
 from desktop.common import METADATA, REPOSITORY, RELEASES_URL, VERSION, atomic_json
 from desktop.runtime import download
 
+#: 本 fork 的修复版后缀，形如 `1.0.2-fix3`。
+#:
+#: ## 为什么必须自己解析
+#:
+#: `-fixN` 不是合法 PEP 440，`Version("1.0.2-fix3")` 会抛 `InvalidVersion`，
+#: 于是老实现 `newer()` 直接返回 False —— 意味着本 fork 发的所有修复版
+#: **永远不可能被识别为更新**。用户点「检查更新」只会看到上游的版本，
+#: 一升级就把带修复的 EXE 覆盖成上游原版，功能静默丢失。
+import re as _re
+
+_FIX_RE = _re.compile(r"^(\d+(?:\.\d+)*)-fix([1-9]\d*)$", _re.IGNORECASE)
+
+
+def parse_version_tag(tag: str):
+    """把 tag 解析成可比较的 `(base_tuple, fix_number)`。
+
+    * `v1.0.2`      → ((1, 0, 2), 0)
+    * `v1.0.2-fix3` → ((1, 0, 2), 3)
+
+    返回 None 表示无法识别（调用方按「不是更新」处理）。
+    """
+    text = str(tag or "").lstrip("vV").strip()
+    if not text:
+        return None
+    match = _FIX_RE.match(text)
+    if match:
+        base = tuple(int(x) for x in match.group(1).split("."))
+        return base, int(match.group(2))
+    try:
+        version = Version(text)
+    except InvalidVersion:
+        return None
+    # 预发布版（rc/beta）不参与更新比较，沿用原策略
+    if version.is_prerelease:
+        return None
+    return tuple(version.release), 0
+
 
 def newer(tag: str, current=VERSION) -> bool:
-    try:
-        candidate = Version(tag.lstrip("vV"))
-        return not candidate.is_prerelease and candidate > Version(current)
-    except InvalidVersion:
+    """`tag` 是否比 `current` 更新。
+
+    比较顺序：先比基础版本号，基础相同时再比 `-fixN` 的序号。
+    这样 `1.0.2-fix2` > `1.0.2-fix1` > `1.0.2`，而 `1.0.3` > `1.0.2-fix9`。
+    """
+    candidate = parse_version_tag(tag)
+    if candidate is None:
         return False
+    base, fix = candidate
+    mine = parse_version_tag(current)
+    if mine is None:
+        # 当前版本号不可解析（极可能是开发态），保守认为没有更新
+        return False
+    my_base, my_fix = mine
+    # 补齐长度，避免 (1,0) 与 (1,0,2) 直接比大小出错
+    width = max(len(base), len(my_base))
+    base += (0,) * (width - len(base))
+    my_base += (0,) * (width - len(my_base))
+    if base != my_base:
+        return base > my_base
+    return fix > my_fix
 
 
 def release_url(url: str) -> str:

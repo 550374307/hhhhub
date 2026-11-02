@@ -47,6 +47,19 @@ PATHS = (
 PUBLIC = "raccoon"
 MAX_ATTEMPTS = 3
 
+
+class _BadRequest(Exception):
+    """请求体本身有问题（客户端错误），应由调用方转成 400。
+
+    单独一个类型是为了让它**穿过** `except Exception` 的资源清理分支
+    之后不被当成 5xx —— 同时又不绕过清理（直接 return 会泄漏 Session）。
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
 #: 上游只认这三种角色。`developer` 是 OpenAI 新角色，原样透传会被上游
 #: 静默丢弃 —— 表现为「回复里没有系统提示」而不是报错，极难排查。
 _UPSTREAM_ROLES = frozenset({"system", "user", "assistant"})
@@ -225,9 +238,18 @@ def prepare_body(body: dict) -> dict:
     """
     out = dict(body)
     out["messages"] = normalize_messages(body.get("messages"))
-    # 小浣熊模型名就是目录里的 name，不需要加后缀
     if not out["messages"]:
-        out["messages"] = [{"role": "user", "content": "hi"}]
+        # ⚠️ 不要静默塞一句 "hi"。
+        #
+        # 触发这里的两类输入都**不该被悄悄改写**：
+        #   1. 只带图片的用户消息 —— 小浣熊目录只有 chat 模型，
+        #      图片块在 normalize 时被丢弃，于是整条消息变空。
+        #      换成 "hi" 会得到一个「凭空回答 hi」的诡异响应。
+        #   2. 客户端传了非法 messages —— 明确报错比伪造请求有用。
+        #
+        # 抛 `ValueError`，由 `_forward` 转成 400 给调用方。
+        raise ValueError("messages 归一后为空：请检查是否只发送了不受支持的"
+                         "消息类型（本平台目录只有 chat 模型，图片块会被丢弃）")
     if out.get("stream"):
         options = out.get("stream_options")
         options = dict(options) if isinstance(options, dict) else {}
@@ -348,7 +370,19 @@ async def _forward(body: dict, request) -> JSONResponse:
     db = SessionLocal()
     try:
         key = shared.authenticate(db, request, platform=PUBLIC)
-        body = prepare_body(body)
+        try:
+            body = prepare_body(body)
+        except ValueError as exc:
+            # 请求体归一后为空（如只发了图片块）—— 明确的客户端错误，
+            # 不是服务端故障，也绝不能伪造一句 "hi" 发上去。
+            #
+            # 这里可以直接 return：本函数有 `finally: db.close()`。
+            # （流式那条路径没有同样的 finally，所以它用 _BadRequest
+            #  穿过资源清理分支 —— 两处写法不同是有原因的。）
+            return JSONResponse(
+                {"error": {"type": "invalid_request_error",
+                           "code": "empty_messages", "message": str(exc)}},
+                status_code=400)
         try:
             result, account, started = _attempt(db, request, key, body, realm)
         except shared.PlatformRejected:
@@ -405,7 +439,16 @@ async def _forward_stream(body: dict, request):
         # 这是**匿名请求也能打到**的路径，必须保证 db 被关掉：
         # 连接池上限 20+40，泄漏 60 次后全站 DB 操作都会超时。
         key = shared.authenticate(db, request, platform=PUBLIC)
-        body = prepare_body(body)
+        try:
+            body = prepare_body(body)
+        except ValueError as exc:
+            # 请求体归一后为空（如只发了图片块）—— 明确的客户端错误。
+            #
+            # ⚠️ 这里**不能直接 return**：`return` 会跳过下面的
+            # `except Exception`（那里才关 db），造成 Session 泄漏 ——
+            # 匿名请求调用 60 次就能耗尽连接池、全站 DB 超时。
+            # 用局部异常触发统一清理，再在 except 里转成 400。
+            raise _BadRequest("empty_messages", str(exc)) from exc
         body["stream"] = True
         model = str(body.get("model") or "")
         stats: dict = {}
@@ -452,6 +495,18 @@ async def _forward_stream(body: dict, request):
                 last_error = client.UpstreamError(
                     "小浣熊调用异常（%s）" % type(exc).__name__, kind="upstream")
                 exclude.add(account.id)
+    except _BadRequest as exc:
+        # 客户端错误：释放已持有资源（此处通常没有），关 db，回 400。
+        if leased and account is not None:
+            try:
+                shared.release(account)
+            except Exception:  # noqa: BLE001
+                pass
+        db.close()
+        return JSONResponse(
+            {"error": {"type": "invalid_request_error",
+                       "code": exc.code, "message": exc.message}},
+            status_code=400)
     except Exception:
         # 鉴权失败 / 选号中断：释放一切已持有的资源再抛出
         if leased and account is not None:
@@ -532,6 +587,23 @@ async def _forward_stream(body: dict, request):
             yield ("data: %s\n\n" % json.dumps(
                 {"error": {"message": exc.message, "type": exc.kind}},
                 ensure_ascii=False)).encode()
+        except Exception as exc:  # noqa: BLE001
+            # ⚠️ 这里必须兜住**所有**异常，不能只 catch UpstreamError。
+            # 上游中途断流抛的是 `httpx.RemoteProtocolError` /
+            # `httpx.ReadTimeout`，它不在 UpstreamError 的继承链上 ——
+            # 旧写法会让异常逃出生成器，客户端收到的是
+            # 「无 [DONE]、无错误帧」的裸截断，表现成「回复说到一半没了」，
+            # 且网关日志里只有一条 traceback，看不出是流断的。
+            # 补一个合法的错误帧 + [DONE]，客户端才能正常收尾。
+            logger.warning("小浣熊流式转发中断：%s", type(exc).__name__)
+            try:
+                yield ("data: %s\n\n" % json.dumps(
+                    {"error": {"message": "上游连接中断（%s）"
+                                          % type(exc).__name__,
+                               "type": "upstream_error"}},
+                    ensure_ascii=False)).encode()
+            except Exception:  # noqa: BLE001 - 客户端可能已断开
+                pass
         finally:
             # 快路径：正常结束时立即清理
             cleanup()
@@ -544,49 +616,174 @@ async def _forward_stream(body: dict, request):
 
 
 def _relay_stream(upstream, holder: dict):
-    """逐帧转发上游 SSE，抓 usage，必要时补 `[DONE]`。"""
+    """逐事件转发上游 SSE，抓 usage，必要时补 `[DONE]`。
+
+    ## 必须同时兼容两种上游形态
+
+    SSE 规范里一个事件是「多行 `data:` 直到空行」。但真实上游分两类：
+
+      A. **标准形态**：每个事件以空行结尾，长 body 会拆成多行 `data:`。
+      B. **精简形态**：一条 `data:` 就是一个完整 JSON，**不发空行**。
+
+    只按 A 处理会把 B 的连续几个 chunk 拼成一条非法 payload
+    （`{"a":1}{"b":2}`），`json.loads` 失败 → 整段流内容丢失；
+    只按 B 处理会把 A 的多行 body 拆成多个坏帧。
+
+    判据：读到一条 `data:` 且**累积内容本身就是一个完整 JSON**，
+    说明它自成事件（形态 B），立即提交；否则继续累积等空行（形态 A）。
+    这个探测只在「还没有后续行」时做猜测 —— 一旦该事件后面确实跟了
+    空行，两种判据结论一致，不会歧义。
+    """
     saw_done = False
-    for raw in upstream.iter_lines():
-        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
-        line = line.rstrip("\r\n")
-        if not line:
-            continue
-        if line.startswith("data:"):
-            payload = line[5:].strip()
-            if payload == "[DONE]":
-                saw_done = True
-                holder.setdefault("usage", holder.get("usage") or {})
-                yield b"data: [DONE]\n\n"
-                continue
-            try:
-                chunk = json.loads(payload)
-            except ValueError:
-                yield (line + "\n\n").encode()
-                continue
-            # ⚠️ 上游偶尔发 `data: "pong"` / `data: [1,2,3]` 这类非对象帧
-            # （心跳、厂商扩展）。直接 `.get()` 会 AttributeError，
-            # 而它不在 `except UpstreamError` 的覆盖范围内 —— 整个流被截断，
-            # 连带触发生成器 finally 的时机问题。原样透传即可。
-            if not isinstance(chunk, dict):
-                yield ("data: %s\n\n" % json.dumps(chunk, ensure_ascii=False)).encode()
-                continue
+    data_lines: list[str] = []
+    head_lines: list[str] = []
+
+    def emit(payload: str, head: str):
+        """产出单帧。返回 True 表示是 [DONE]。"""
+        if payload.strip() == "[DONE]":
+            holder.setdefault("usage", holder.get("usage") or {})
+            return "done"
+        try:
+            chunk = json.loads(payload)
+        except ValueError:
+            # 不是 JSON：原样透传，别吞。
+            # 注意 `id:` / `event:` / `retry:` 这些 head 行在 JSON 分支也要带上，
+            # 否则 `Last-Event-ID` 续传会失效（之前只在非 JSON 分支拼 head）。
+            body = "".join("data: %s\n" % x for x in payload.split("\n"))
+            return head + body + "\n"
+        # ⚠️ 上游偶尔发 `data: "pong"` / `data: [1,2,3]` 这类非对象帧
+        # （心跳、厂商扩展）。直接 `.get()` 会 AttributeError，
+        # 而它不在 `except UpstreamError` 覆盖范围内 —— 整个流被截断。
+        if isinstance(chunk, dict):
             usage = chunk.get("usage")
             if isinstance(usage, dict) and usage:
                 holder["usage"] = usage
-            yield ("data: %s\n\n" % json.dumps(chunk, ensure_ascii=False)).encode()
-        else:
-            # 冒号心跳 / event: 行原样保留
+        return head + "data: %s\n\n" % json.dumps(chunk, ensure_ascii=False)
+
+    def commit():
+        if not data_lines:
+            return None
+        return emit("\n".join(data_lines), "".join(head_lines))
+
+    for raw in upstream.iter_lines():
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else str(raw)
+        line = line.rstrip("\r\n")
+
+        # 空行 = 事件边界（形态 A）
+        if not line:
+            out = commit()
+            data_lines, head_lines = [], []
+            if out is None:
+                continue
+            if out == "done":
+                saw_done = True
+                yield b"data: [DONE]\n\n"
+                continue
+            yield out.encode()
+            continue
+
+        if line.startswith("data:"):
+            piece = line[5:].lstrip()
+            data_lines.append(piece)
+            # 形态 B 探测：单行即完整 **对象** 时立刻提交。
+            #
+            # ⚠️ 判据必须是「以 `{` 开头且解析成 dict」，不能是「能 json.loads」。
+            # 实测漏洞：形态 A 的多行事件写成
+            #     data: 123
+            #     data: 456
+            #     data: 789
+            # （想表达一个数组）时，`123` 本身是合法 JSON → 被当成形态 B
+            # 提前提交，整个事件被拆成 3 帧。
+            # 真实上游 chunk 都是闭合对象，加 `{` 前缀判断即可排除标量/数组；
+            # 再要求结果是 dict，避免 `[1,2,3]` 这种扩展帧被误判。
+            if len(data_lines) == 1 and piece.startswith("{"):
+                try:
+                    if not isinstance(json.loads(piece), dict):
+                        raise ValueError("not a dict")
+                except ValueError:
+                    pass
+                else:
+                    out = commit()
+                    data_lines, head_lines = [], []
+                    if out == "done":
+                        saw_done = True
+                        yield b"data: [DONE]\n\n"
+                    elif out is not None:
+                        yield out.encode()
+        elif line.startswith(":"):
+            # 注释/心跳：直接透传，不参与事件聚合
             yield (line + "\n").encode()
+        else:
+            head_lines.append(line + "\n")
+
+    # 上游没给结尾空行时，把最后一个事件补出去
+    out = commit()
+    if out is not None:
+        if out == "done":
+            saw_done = True
+            yield b"data: [DONE]\n\n"
+        else:
+            yield out.encode()
+
     if not saw_done:
         yield b"data: [DONE]\n\n"
 
 
-# ---------------------------------------------------------------------------
-# Anthropic / Responses 适配
-# ---------------------------------------------------------------------------
+def _anthropic_tools_to_openai(raw) -> list[dict]:
+    """Anthropic `tools` → OpenAI `tools`。
+
+    Anthropic 的形状是扁平定义：
+
+        {"name": "read", "description": "...", "input_schema": {...}}
+
+    OpenAI 是嵌在 `function` 里、且键名是 `parameters`：
+
+        {"type": "function", "function": {"name": ..., "parameters": {...}}}
+
+    漏掉这个转换的后果**不是报错，而是工具彻底发不出去**：
+    上游永远不回 tool_calls，走 /v1/messages 的客户端（Claude Code 等）
+    任务直接卡死。响应方向的 `_anthropic_tool_blocks()` 一直是完整的，
+    只有请求方向漏了 —— 典型的单向遗漏。
+    """
+    out: list[dict] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or "").strip()
+        if not name:
+            continue
+        schema = item.get("input_schema")
+        if not isinstance(schema, dict):
+            schema = {"type": "object", "properties": {}}
+        fn: dict = {"name": name, "parameters": schema}
+        desc = item.get("description")
+        if isinstance(desc, str) and desc.strip():
+            fn["description"] = desc
+        out.append({"type": "function", "function": fn})
+    return out
+
+
+def _anthropic_tool_choice_to_openai(raw):
+    """Anthropic `tool_choice` → OpenAI `tool_choice`。"""
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("type") or "").strip().lower()
+    if kind == "auto":
+        return "auto"
+    if kind == "any":
+        return "required"
+    if kind == "none":
+        return "none"
+    if kind == "tool" and raw.get("name"):
+        return {"type": "function", "function": {"name": raw["name"]}}
+    return None
+
+
 def _anthropic_to_openai(body: dict) -> dict:
-    """Anthropic 请求体 → OpenAI 请求体。"""
-    messages = []
+    """Anthropic 请求体 → OpenAI 请求体（含工具双向映射）。"""
+    messages: list[dict] = []
     system = body.get("system")
     if isinstance(system, str) and system.strip():
         messages.append({"role": "system", "content": system})
@@ -595,26 +792,86 @@ def _anthropic_to_openai(body: dict) -> dict:
                        if isinstance(b, dict))
         if text.strip():
             messages.append({"role": "system", "content": text})
+
     for item in body.get("messages") or []:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip().lower()
         content = item.get("content")
+
         if isinstance(content, list):
-            parts = []
+            texts: list[str] = []
+            tool_uses: list[dict] = []
+            tool_results: list[dict] = []
             for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(str(block.get("text") or ""))
-                elif isinstance(block, str):
-                    parts.append(block)
-            content = "".join(parts)
+                if not isinstance(block, dict):
+                    if isinstance(block, str):
+                        texts.append(block)
+                    continue
+                btype = str(block.get("type") or "")
+                if btype == "text":
+                    texts.append(str(block.get("text") or ""))
+                elif btype == "tool_use":
+                    # assistant 发起的工具调用 → OpenAI tool_calls
+                    tool_uses.append({
+                        "id": block.get("id") or "call_%d" % len(tool_uses),
+                        "type": "function",
+                        "function": {
+                            "name": str(block.get("name") or "unknown"),
+                            "arguments": json.dumps(block.get("input") or {},
+                                                    ensure_ascii=False),
+                        },
+                    })
+                elif btype == "tool_result":
+                    # tool_result 在 Anthropic 里是**user 消息内的块**，
+                    # 到 OpenAI 必须拆成独立的 `role=tool` 消息，
+                    # 否则上游看不到结果、会重复调同一个工具。
+                    raw_c = block.get("content")
+                    if isinstance(raw_c, list):
+                        txt = "".join(str(b.get("text") or "") for b in raw_c
+                                      if isinstance(b, dict))
+                    else:
+                        txt = "" if raw_c is None else str(raw_c)
+                    tool_results.append({
+                        "role": "tool",
+                        "tool_call_id": block.get("tool_use_id") or "",
+                        "content": txt,
+                    })
+            text = "".join(texts)
+            if tool_results and role == "user":
+                # 工具结果先作为独立 tool 消息发出
+                if text.strip():
+                    messages.append({"role": "user", "content": text})
+                messages.extend(tool_results)
+                continue
+            if tool_uses:
+                msg: dict = {"role": "assistant"}
+                msg["content"] = text if text.strip() else None
+                msg["tool_calls"] = tool_uses
+                messages.append(msg)
+                continue
+            if text.strip():
+                messages.append({"role": role or "user", "content": text})
+            continue
+
         if role and content is not None:
             messages.append({"role": role, "content": content})
+
     out = {"model": body.get("model"), "messages": messages,
            "max_tokens": body.get("max_tokens") or 4096}
-    for key in ("temperature", "top_p", "stream"):
+    for key in ("temperature", "top_p", "stream", "stop_sequences",
+                "metadata", "top_k"):
         if key in body:
-            out[key] = body[key]
+            mapped = "stop" if key == "stop_sequences" else key
+            out[mapped] = body[key]
+
+    # ---- 工具：请求方向必须映射，否则客户端发不出工具 ----
+    tools = _anthropic_tools_to_openai(body.get("tools"))
+    if tools:
+        out["tools"] = tools
+    choice = _anthropic_tool_choice_to_openai(body.get("tool_choice"))
+    if choice is not None:
+        out["tool_choice"] = choice
     return out
 
 
@@ -777,7 +1034,24 @@ async def _forward_stream_anthropic(body: dict, request, model: str):
     async def relay():
         msg_id = "msg_raccoon_" + str(int(time.time() * 1000))
         started = False
+        finished = False
         usage_seen: dict = {}
+
+        def close_events():
+            """content_block_stop + message_delta + message_stop 三帧收尾。"""
+            return [
+                ("data: %s\n\n" % json.dumps(
+                    {"type": "content_block_stop", "index": 0},
+                    ensure_ascii=False)).encode(),
+                ("data: %s\n\n" % json.dumps(
+                    {"type": "message_delta",
+                     "delta": {"stop_reason": "end_turn"},
+                     "usage": _anthropic_usage_of(usage_seen)},
+                    ensure_ascii=False)).encode(),
+                ("data: %s\n\n" % json.dumps(
+                    {"type": "message_stop"}, ensure_ascii=False)).encode(),
+            ]
+
         async for frame in inner.body_iterator:
             text = frame.decode("utf-8", "replace") if isinstance(frame, bytes) else str(frame)
             for line in text.split("\n"):
@@ -797,17 +1071,10 @@ async def _forward_stream_anthropic(body: dict, request, model: str):
                 delta = choice.get("delta") or {}
                 piece = delta.get("content") or delta.get("reasoning_content") or ""
                 if not piece:
-                    if choice.get("finish_reason") and started:
-                        yield ("data: %s\n\n" % json.dumps(
-                            {"type": "content_block_stop", "index": 0},
-                            ensure_ascii=False)).encode()
-                        yield ("data: %s\n\n" % json.dumps(
-                            {"type": "message_delta",
-                             "delta": {"stop_reason": "end_turn"},
-                             "usage": _anthropic_usage_of(usage_seen)},
-                            ensure_ascii=False)).encode()
-                        yield ("data: %s\n\n" % json.dumps(
-                            {"type": "message_stop"}, ensure_ascii=False)).encode()
+                    if choice.get("finish_reason") and started and not finished:
+                        finished = True
+                        for ev in close_events():
+                            yield ev
                     continue
                 if not started:
                     started = True
@@ -826,6 +1093,17 @@ async def _forward_stream_anthropic(body: dict, request, model: str):
                     {"type": "content_block_delta", "index": 0,
                      "delta": {"type": "text_delta", "text": piece}},
                     ensure_ascii=False)).encode()
+
+        # ⚠️ 收尾不能只挂在 `finish_reason` 上。
+        #
+        # 实测（2026-11-03）：上游某些模型/截断场景**不发 finish_reason**
+        # 就结束流。旧写法把三帧收尾全塞在 finish_reason 分支里，于是
+        # 客户端只收到 message_start + 若干 delta、**永远等不到 message_stop**，
+        # 表现为「回答完了但界面一直转圈」，只能超时。
+        # 这里保证：只要开过头，流结束时一定补齐收尾。
+        if started and not finished:
+            for ev in close_events():
+                yield ev
 
     return StreamingResponse(
         relay(), media_type="text/event-stream",
@@ -848,14 +1126,66 @@ async def count_tokens(request):
 
 
 async def responses(request):
-    """OpenAI Responses 协议。"""
+    """OpenAI Responses 协议 → chat.completions。
+
+    ## 白名单 + 值映射（不是简单剔字段）
+
+    Responses 协议和 chat.completions 的差别不只是「字段名不同」，
+    有些是**结构不同**，光把键名加进白名单没用：
+
+        instructions        → 必须转成 `role=system` 的消息（见下）
+        max_output_tokens   → max_tokens
+        reasoning: {effort} → reasoning_effort（扁平）
+        text: {format}      → response_format（形状不同）
+
+    ## ⚠️ `instructions` 必须显式转成 system 消息
+
+    它是 Responses 里的 system prompt。实测（2026-11-03）白名单版本
+    真正发到上游的 body 是：
+
+        CLIENT  : instructions / input / max_output_tokens / reasoning / ...
+        UPSTREAM: max_tokens / messages / model / stream / ...
+
+    `instructions` 被静默丢掉 —— 所有带 system prompt 的调用退化成
+    裸用户消息，角色与格式约束全部失效，**而且不报错**。
+    这类「静默降级」比 400 更难发现，必须在入口就转成消息。
+    """
     body = await _body_of(request)
-    normalized = dict(body)
+    # 只挑 chat 认识的字段，其余丢弃（上游不认识会 400 或静默忽略）。
+    _CHAT_KEYS = ("model", "temperature", "top_p", "stream", "stop",
+                  "presence_penalty", "frequency_penalty", "seed",
+                  "response_format", "tool_choice", "tools", "user",
+                  # 下面这些是 chat.completions 的标准参数，白名单最容易漏：
+                  # `n`（多候选）、`logprobs`/`top_logprobs`（对数概率）、
+                  # `logit_bias`（token 偏置）、`parallel_tool_calls`
+                  # （一次是否可返回多个工具调用）、`service_tier`。
+                  # 漏掉不会报错，只会**静默改变上游行为** ——
+                  # 比如 `n=3` 只回 1 个候选，客户端以为模型不支持多候选。
+                  "n", "logprobs", "top_logprobs", "logit_bias",
+                  "parallel_tool_calls", "service_tier",
+                  "stream_options", "reasoning_effort")
+    normalized = {k: body[k] for k in _CHAT_KEYS if k in body}
+
+    # reasoning.effort → reasoning_effort（结构不同，必须取值）
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        normalized.setdefault("reasoning_effort", reasoning["effort"])
+    # text.format → response_format（结构不同，必须取值）
+    text_cfg = body.get("text")
+    if isinstance(text_cfg, dict) and isinstance(text_cfg.get("format"), dict):
+        normalized.setdefault("response_format", text_cfg["format"])
+
     raw_input = body.get("input")
+    messages: list[dict] = []
+    # ⚠️ instructions 是 system prompt，必须先放进 messages
+    instructions = body.get("instructions")
+    if isinstance(instructions, str) and instructions.strip():
+        messages.append({"role": "system", "content": instructions})
     if isinstance(raw_input, str):
-        normalized["messages"] = [{"role": "user", "content": raw_input}]
+        messages.append({"role": "user", "content": raw_input})
     elif isinstance(raw_input, list):
-        normalized["messages"] = raw_input
+        messages.extend(raw_input)
+    normalized["messages"] = messages
     normalized.setdefault("max_tokens", body.get("max_output_tokens") or 4096)
     model = str(body.get("model") or "")
     if not body.get("stream"):

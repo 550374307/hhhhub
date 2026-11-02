@@ -217,7 +217,7 @@ def request_json(method: str, url: str, *, token: str, realm: str = "cn",
     if json_body is not None:
         headers["Content-Type"] = "application/json"
     tag = "raccoon#%s" % (account_id if account_id is not None else "-")
-    started = time.time()
+    started = time.perf_counter()
     try:
         with httpx.Client(timeout=TIMEOUT, follow_redirects=True) as client:
             resp = client.request(method, url, headers=headers,
@@ -227,7 +227,7 @@ def request_json(method: str, url: str, *, token: str, realm: str = "cn",
         # RequestError 会回显完整请求头，里面有 `Authorization: Bearer ...`。
         raise UpstreamError("%s 网络错误（%s）" % (tag, type(exc).__name__),
                             kind="upstream", detail=_redact(str(exc))) from exc
-    elapsed = int((time.time() - started) * 1000)
+    elapsed = int((time.perf_counter() - started) * 1000)
     text = resp.text or ""
     status = resp.status_code
 
@@ -302,17 +302,17 @@ class _StreamHandle:
         self._closed = False
 
     def iter_lines(self):
-        started = time.time()
+        started = time.perf_counter()
         try:
             for line in self._response.iter_lines():
                 if self._first:
                     self._first = False
                     if self._stats is not None:
-                        self._stats["ttfb_ms"] = int((time.time() - started) * 1000)
+                        self._stats["ttfb_ms"] = int((time.perf_counter() - started) * 1000)
                 yield line
         finally:
             if self._stats is not None and not self._stats.get("total_ms"):
-                self._stats["total_ms"] = int((time.time() - started) * 1000)
+                self._stats["total_ms"] = int((time.perf_counter() - started) * 1000)
 
     def close(self):
         """幂等关闭；与 `iter_lines()` 互斥。"""
