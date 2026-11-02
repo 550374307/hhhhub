@@ -26,6 +26,11 @@ def main():
     import resvg_py
     from PIL import Image
     version = json.loads((ROOT / "desktop/version.json").read_text(encoding="utf-8"))["version"]
+    # `release` 可以带 fork 修复后缀（`1.0.2-fix3`），用于**展示**；
+    # `version` 必须保持纯数字三段，供 VS_VERSIONINFO 的 filevers 与
+    # 文件名使用（那里只接受整数元组）。
+    metadata = json.loads((ROOT / "desktop/version.json").read_text(encoding="utf-8"))
+    display = str(metadata.get("release") or version)
     parts = tuple(int(v) for v in version.split("."))
     if len(parts) != 3:
         raise SystemExit("desktop/version.json must contain a stable x.y.z version")
@@ -42,9 +47,9 @@ def main():
       kids=[StringFileInfo([StringTable('040904B0', [
         StringStruct('CompanyName', 'MiraiHub'),
         StringStruct('FileDescription', 'MiraiHub Desktop'),
-        StringStruct('FileVersion', '{version}'),
+        StringStruct('FileVersion', '{display}'),
         StringStruct('ProductName', 'MiraiHub'),
-        StringStruct('ProductVersion', '{version}')])]),
+        StringStruct('ProductVersion', '{display}')])]),
         VarFileInfo([VarStruct('Translation', [1033, 1200])])])'''
     (ROOT / "build/version-resource.txt").write_text(resource, encoding="utf-8")
     env = dict(os.environ, PYTHONUTF8="1")

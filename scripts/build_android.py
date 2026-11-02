@@ -226,10 +226,12 @@ def main() -> None:
     if args.with_debug:
         tasks.append("assembleDebug")
     subprocess.run([gradle, "--no-daemon", *tasks], cwd=ROOT / "android", env=env, check=True)
-    version = json.loads((ROOT / "desktop/version.json").read_text(encoding="utf-8"))["version"]
+    meta = json.loads((ROOT / "desktop/version.json").read_text(encoding="utf-8"))
+    # 产物名用 release（可带 -fixN），与桌面端保持同一口径
+    release = str(meta.get("release") or meta["version"])
     output = ROOT / "dist/android"
     output.mkdir(parents=True, exist_ok=True)
-    target = output / f"miraihub-{version}-android-arm64.apk"
+    target = output / f"miraihub-{release}-android-arm64.apk"
     shutil.copy2(ROOT / "android/app/build/outputs/apk/release/app-release.apk", target)
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     target.with_suffix(".apk.sha256").write_text(f"{digest}  {target.name}\n", encoding="ascii")

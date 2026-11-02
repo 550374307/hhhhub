@@ -9,7 +9,7 @@ from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
 
-from desktop.common import METADATA, REPOSITORY, RELEASES_URL, VERSION, atomic_json
+from desktop.common import METADATA, RELEASE, REPOSITORY, RELEASES_URL, VERSION, atomic_json
 from desktop.runtime import download
 
 #: 本 fork 的修复版后缀，形如 `1.0.2-fix3`。
@@ -50,7 +50,7 @@ def parse_version_tag(tag: str):
     return tuple(version.release), 0
 
 
-def newer(tag: str, current=VERSION) -> bool:
+def newer(tag: str, current=RELEASE) -> bool:
     """`tag` 是否比 `current` 更新。
 
     比较顺序：先比基础版本号，基础相同时再比 `-fixN` 的序号。
@@ -108,7 +108,7 @@ class UpdateService:
         # 遇到修复版 tag 会抛 InvalidVersion，整个快照直接崩掉。
         candidates = [r for r in self.releases if newer(r["tag"]) and self.matches_asset(r)]
         latest = max(candidates, key=lambda r: self._sort_key(r["tag"]), default=None)
-        return {"version": VERSION, "platform": self.platform, "releases": self.releases, "latest": latest,
+        return {"version": RELEASE, "platform": self.platform, "releases": self.releases, "latest": latest,
                 "available": latest is not None, "error": self.error,
                 "checked": self.checked, "releases_url": RELEASES_URL}
 

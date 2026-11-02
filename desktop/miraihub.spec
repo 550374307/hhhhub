@@ -4,8 +4,11 @@ import json
 from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 root = Path(SPECPATH).parent
-version = json.loads((root / 'desktop/version.json').read_text(encoding='utf-8'))['version']
-name = f'miraihub-{version}-windows-x64'
+_meta = json.loads((root / 'desktop/version.json').read_text(encoding='utf-8'))
+# 产物名与「安装包显示版本」都用 release（可带 -fixN），
+# 这样用户从文件名就能区分是哪个修复版，而不是一堆同名的 1.0.2。
+_release = str(_meta.get('release') or _meta['version'])
+name = f'miraihub-{_release}-windows-x64'
 datas = [(str(root / 'admin/static'), 'admin/static'),
          # The authenticated management console lives outside the public
          # static directory and must be present in the desktop bundle too.

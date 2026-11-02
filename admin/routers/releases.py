@@ -8,14 +8,19 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from admin.security import require_admin
-from desktop.common import ROOT, VERSION, RELEASES_URL
+from desktop.common import RELEASE, ROOT, VERSION, RELEASES_URL
 
 router = APIRouter(prefix="/api/app", tags=["releases"])
 
 
 @router.get("/version")
 def version():
-    return {"version": VERSION, "releases_url": RELEASES_URL}
+    """当前版本。
+
+    `version` 返回**对外展示版本**（可带 `-fixN`），界面与更新比较都用它；
+    `base` 额外给出纯数字基础版本，方便需要做数值换算的客户端。
+    """
+    return {"version": RELEASE, "base": VERSION, "releases_url": RELEASES_URL}
 
 
 @router.get("/network", dependencies=[Depends(require_admin)])

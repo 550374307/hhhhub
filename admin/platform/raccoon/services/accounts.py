@@ -330,7 +330,38 @@ def apply_quota(account: Account, quota: dict) -> None:
         "monthly_balance": int(quota.get("monthly_balance") or 0),
         "reward": int(quota.get("reward") or 0),
         "models": int(quota.get("models") or 0),
+        # 完整同步成功 → 明确标记「不是旧值」，用来盖掉上次的 partial 标记
+        "quota_stale": False,
     }, ensure_ascii=False)[:20000]
+
+
+def _apply_partial_quota(account: Account, models_count: int) -> None:
+    """凭证有效但额度读不到时，只回写**确实探到的**部分。
+
+    余额列保持原值（可能是上次成功的快照，也可能是 0）；
+    模型数是刚探到的真实值，必须写；同时打 `quota_stale` 标记，
+    让前端能区分「刚同步过」和「这次同步失败、数值是旧的」。
+    """
+    previous = {}
+    try:
+        previous = json.loads(account.credits_snapshot or "{}") or {}
+    except ValueError:
+        previous = {}
+    previous = previous if isinstance(previous, dict) else {}
+    account.credits_snapshot = json.dumps({
+        "unit": "points",
+        "quota_kind": "balance",
+        "available": int(previous.get("available") or 0),
+        "daily_balance": int(previous.get("daily_balance") or 0),
+        "monthly_balance": int(previous.get("monthly_balance") or 0),
+        "reward": int(previous.get("reward") or 0),
+        "models": int(models_count),
+        # 关键：告诉前端「余额是旧的」
+        "quota_stale": True,
+        "quota_stale_reason": "积分接口不可用",
+    }, ensure_ascii=False)[:20000]
+    account.last_sync_at = datetime.utcnow()
+    account.credits_synced_at = datetime.utcnow()
 
 
 def quota_is_fresh(account: Account) -> bool:
@@ -403,8 +434,11 @@ def sync_quota(db: Session, account: Account, *, mark_disabled: bool = True) -> 
         # 凭证已确认有效，这里只是额度读不到。保留上一次快照，不覆盖成 0。
         logger.info("小浣熊账号 %s 积分接口不可用（%s），保留上次快照",
                     account.id, exc.kind)
-        account.last_sync_at = datetime.utcnow()
-        account.credits_synced_at = datetime.utcnow()
+        # ⚠️ 必须把**已知的模型数**写回去。
+        # 早期这里只更新时间戳就返回，结果账号池里所有号都显示「0 模型」，
+        # 看起来像「这个号什么都调不了」，实际它的目录是好的。
+        # 余额沿用旧值（不写 0），模型数是刚探到的真实值，可以写。
+        _apply_partial_quota(account, models_count)
         db.commit()
         return {"ok": False, "partial": True, "models": models_count,
                 "error": exc.to_dict(),
@@ -440,6 +474,10 @@ def public_view(account: Account, *, quota: dict | None = None) -> dict:
         "quota_kind": "balance",
         "quota_live": bool(quota) or bool(snapshot),
         "models": int((quota or {}).get("models") or snapshot.get("models") or 0),
+        # 余额是否「过期值」：上游积分接口 403 时会沿用上次快照，
+        # 不打这个标记的话界面无法区分「刚同步」和「同步失败」。
+        "quota_stale": bool(snapshot.get("quota_stale")),
+        "quota_stale_reason": str(snapshot.get("quota_stale_reason") or ""),
         "phone": str(data.get("phone") or ""),
         "has_refresh": bool(refresh_token_of(data)),
         "expires_at": int(data.get("expires_at") or 0),
