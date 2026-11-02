@@ -104,15 +104,35 @@ class UpdateService:
             pass
 
     def snapshot(self) -> dict:
+        # ⚠️ 排序键不能用 `Version(r["tag"])`：`-fixN` 不是合法 PEP 440，
+        # 遇到修复版 tag 会抛 InvalidVersion，整个快照直接崩掉。
         candidates = [r for r in self.releases if newer(r["tag"]) and self.matches_asset(r)]
-        latest = max(candidates, key=lambda r: Version(r["tag"].lstrip("vV")), default=None)
+        latest = max(candidates, key=lambda r: self._sort_key(r["tag"]), default=None)
         return {"version": VERSION, "platform": self.platform, "releases": self.releases, "latest": latest,
                 "available": latest is not None, "error": self.error,
                 "checked": self.checked, "releases_url": RELEASES_URL}
 
+    @staticmethod
+    def _sort_key(tag: str):
+        """可比较的排序键（含 -fixN）。解析不了的排最前。"""
+        parsed = parse_version_tag(tag)
+        if parsed is None:
+            return ((-1,), -1)
+        base, fix = parsed
+        return (base, fix)
+
     def matches_asset(self, release: dict) -> bool:
-        expected = self.asset_pattern.format(version=release["tag"].lstrip("vV"))
-        return (release.get("asset") or {}).get("name") == expected
+        """该 release 是否带有可下载的本平台产物。
+
+        注意这里**不再比对文件名**：资产名由构建时的 version.json 决定，
+        与 tag 可能不同（修复版 tag `v1.0.2-fix1` 的产物叫
+        `miraihub-1.0.2-windows-x64.exe`）。文件名匹配已在 `check()` 里
+        完成并落在 `asset` 字段上，这里只需确认「确实拿到了资产 + 有校验」。
+        """
+        asset = release.get("asset") or {}
+        if not asset.get("name"):
+            return False
+        return bool(release.get("installable"))
 
     def check(self) -> dict:
         with self.lock:
@@ -131,10 +151,25 @@ class UpdateService:
                     if row.get("draft") or row.get("prerelease"):
                         continue
                     tag = str(row.get("tag_name", ""))
-                    filename = self.asset_pattern.format(version=tag.lstrip("vV"))
                     assets = {a["name"]: a for a in row.get("assets", [])}
+                    # ⚠️ 资产名里的版本号取自 **desktop/version.json**（构建时），
+                    # 不是 tag。修复版 tag 是 `v1.0.2-fix1` 而产物仍叫
+                    # `miraihub-1.0.2-windows-x64.exe`。
+                    # 早期这里用 tag 拼文件名，于是修复版永远匹配不到资产、
+                    # 被判成「不可安装」，更新提示直接消失 —— 而且不报错。
+                    # 现在按解析出的基础版本号拼，并回退到「按模式匹配」。
+                    parsed = parse_version_tag(tag)
+                    base_text = ".".join(str(x) for x in parsed[0]) if parsed else tag.lstrip("vV")
+                    filename = self.asset_pattern.format(version=base_text)
                     asset = assets.get(filename)
-                    checksum = assets.get(filename + ".sha256")
+                    if asset is None:
+                        # 兜底：同 tag 下唯一一个 .exe 也算（容忍命名漂移）
+                        exes = [n for n in assets
+                                if n.lower().endswith(".exe") and not n.lower().endswith(".sha256.exe")]
+                        if len(exes) == 1:
+                            filename = exes[0]
+                            asset = assets[filename]
+                    checksum = assets.get(filename + ".sha256") if filename else None
                     digest = (asset or {}).get("digest", "") or ""
                     releases.append({"id": row["id"], "tag": tag, "name": row.get("name") or tag,
                                      "body": (row.get("body") or "暂无更新说明")[:100000],
