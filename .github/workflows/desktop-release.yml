@@ -260,11 +260,34 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
+          # ⚠️ 必须显式指定 name，不能用「下载全部 + merge-multiple」。
+          # 同一个 run 里还有 docker build 的临时 artifact
+          # （`<owner>~<repo>~XXXX.dockerbuild`），一旦它上传未完成或体积
+          # 异常，整步会「Artifact download failed after 5 retries」——
+          # 看起来像网络抖动，实际是被无关 artifact 拖累。
+          name: miraihub-windows-x64
           path: dist
-          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          # Android 包只在签名 Secret 存在时才上传，所以允许缺席
+          name: miraihub-android-arm64
+          path: dist
+        continue-on-error: true
 
       - name: List dist
-        run: ls -la dist
+        run: |
+          set -euo pipefail
+          # Android artifact 解到 dist/android/，上传用的 glob 在 dist/ 下，
+          # 这里把它展平；没有 APK 时静默跳过。
+          if [ -d dist/android ]; then
+            shopt -s nullglob
+            for f in dist/android/*.apk dist/android/*.sha256; do
+              mv "$f" dist/
+            done
+            shopt -u nullglob
+          fi
+          ls -la dist
 
       - name: Publish release
         shell: bash
