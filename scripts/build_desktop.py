@@ -56,7 +56,13 @@ def main():
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
                     "--distpath", str(destination),
                     str(ROOT / "desktop/miraihub.spec")], cwd=ROOT, env=env, check=True)
-    executable = destination / f"miraihub-{version}-windows-x64.exe"
+    # ⚠️ 产物名必须与 `desktop/miraihub.spec` 里的 `name` 一致。
+    # spec 用的是 `release`（可带 -fixN），不是 `version`。
+    # 早期这里写成 `miraihub-{version}-...`，而 spec 已改为 release，
+    # 于是 CI 在 PyInstaller 成功之后读文件时抛：
+    #   FileNotFoundError: ...\dist\miraihub-1.0.2-windows-x64.exe
+    # 表现成「构建失败」，实际 EXE 已经打出来了、只是名字叫 1.0.2-fix3。
+    executable = destination / f"miraihub-{display}-windows-x64.exe"
     digest = hashlib.sha256(executable.read_bytes()).hexdigest()
     executable.with_suffix(".exe.sha256").write_text(f"{digest}  {executable.name}\n", encoding="ascii")
     print(f"Built {executable} ({executable.stat().st_size / 1048576:.1f} MB)")
