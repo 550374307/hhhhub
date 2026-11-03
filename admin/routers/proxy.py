@@ -2551,14 +2551,30 @@ def _aggregate_chat_sse(sse_text: str) -> dict:
       * `delta.tool_calls` 按 `index` 聚合、`arguments` 分片拼接
       * `usage` 取最后一个出现的事件
       * 兼容上游偶发回 `message` 而非 `delta` 的形态
+
+    ## 多候选（`n>1`）必须按 choice.index 分开累积
+
+    客户端的 `n` 是原样透传给上游的，上游会回 index=0/1/2… 多组 delta。
+    早期实现把所有 choice 的 content 都往同一个列表里拼、最后固定输出
+    `choices:[{index:0}]` —— 于是 `n=2` 的响应变成
+
+        choices 长度: 1
+        content: "候选A候选B12"      ← 两组内容串在一起，无法分开
+
+    这不仅是数量少，而是**内容串味**（客户端拿到的是混杂文本）。
+    现在为每个 index 维护独立累加器，输出等量的 choices。
     """
-    content_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    tool_calls: dict[int, dict] = {}
+    #: choice.index -> 该候选的累加状态
+    slots: dict[int, dict] = {}
+
+    def slot_for(index: int) -> dict:
+        return slots.setdefault(index, {
+            "content": [], "reasoning": [], "tool_calls": {},
+            "finish_reason": None, "saw_content": False,
+        })
+
     model: str | None = None
-    finish_reason: str | None = None
     usage: dict | None = None
-    saw_content_delta = False
     created = None
     resp_id = ""
 
@@ -2594,60 +2610,78 @@ def _aggregate_chat_sse(sse_text: str) -> dict:
                 normalize_usage_cache(usage)
             except Exception:  # noqa: BLE001
                 pass
-        for choice in (chunk.get("choices") or []):
+        for pos, choice in enumerate(chunk.get("choices") or []):
             if not isinstance(choice, dict):
                 continue
+            # 上游可能不写 index（少数实现如此）：此时用它在 choices
+            # 数组里的位次。缺 index 又只有一条时等价于 0，行为不变。
+            raw_index = choice.get("index")
+            try:
+                index = int(raw_index) if raw_index is not None else pos
+            except (TypeError, ValueError):
+                index = pos
+            slot = slot_for(index)
             if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
+                slot["finish_reason"] = choice["finish_reason"]
             delta = choice.get("delta") or {}
             if delta.get("content"):
-                content_parts.append(delta["content"])
-                saw_content_delta = True
+                slot["content"].append(delta["content"])
+                slot["saw_content"] = True
             if delta.get("reasoning_content"):
-                reasoning_parts.append(delta["reasoning_content"])
+                slot["reasoning"].append(delta["reasoning_content"])
             msg = choice.get("message") or {}
-            if not saw_content_delta and msg.get("content"):
-                content_parts.append(msg["content"])
-            if not reasoning_parts and msg.get("reasoning_content"):
-                reasoning_parts.append(msg["reasoning_content"])
+            if not slot["saw_content"] and msg.get("content"):
+                slot["content"].append(msg["content"])
+            if not slot["reasoning"] and msg.get("reasoning_content"):
+                slot["reasoning"].append(msg["reasoning_content"])
             for tc in (delta.get("tool_calls") or msg.get("tool_calls") or []):
                 if not isinstance(tc, dict):
                     continue
                 idx = tc.get("index", 0)
-                slot = tool_calls.setdefault(
+                bucket = slot["tool_calls"]
+                tc_slot = bucket.setdefault(
                     idx, {"id": None, "name": None, "arguments": ""})
                 if tc.get("id"):
-                    slot["id"] = tc["id"]
+                    tc_slot["id"] = tc["id"]
                 fn = tc.get("function") or {}
                 if fn.get("name"):
-                    slot["name"] = fn["name"]
+                    tc_slot["name"] = fn["name"]
                 if fn.get("arguments"):
-                    slot["arguments"] += fn["arguments"]
+                    tc_slot["arguments"] += fn["arguments"]
 
-    tcs = None
-    if tool_calls:
-        tcs = [
-            {"id": v["id"], "type": "function",
-             "function": {"name": v["name"], "arguments": v["arguments"]}}
-            for _, v in sorted(tool_calls.items())
-        ]
-        finish_reason = finish_reason or "tool_calls"
+    # 上游一个 choice 都没回时，仍然返回一条空候选（保持旧的兜底形状）
+    if not slots:
+        slots[0] = {"content": [], "reasoning": [], "tool_calls": {},
+                    "finish_reason": None, "saw_content": False}
 
-    message: dict = {"role": "assistant",
-                     "content": "".join(content_parts) or None}
-    if reasoning_parts:
-        message["reasoning_content"] = "".join(reasoning_parts)
-    if tcs:
-        message["tool_calls"] = tcs
+    choices_out = []
+    for index in sorted(slots):
+        slot = slots[index]
+        finish_reason = slot["finish_reason"]
+        tcs = None
+        if slot["tool_calls"]:
+            tcs = [
+                {"id": v["id"], "type": "function",
+                 "function": {"name": v["name"], "arguments": v["arguments"]}}
+                for _, v in sorted(slot["tool_calls"].items())
+            ]
+            finish_reason = finish_reason or "tool_calls"
+        message: dict = {"role": "assistant",
+                         "content": "".join(slot["content"]) or None}
+        if slot["reasoning"]:
+            message["reasoning_content"] = "".join(slot["reasoning"])
+        if tcs:
+            message["tool_calls"] = tcs
+        choices_out.append({"index": index, "message": message,
+                            "finish_reason": finish_reason or "stop",
+                            "logprobs": None})
 
     out: dict = {
         "id": resp_id or f"chatcmpl-{os.urandom(12).hex()}",
         "object": "chat.completion",
         "created": created or int(time.time()),
         "model": model or "",
-        "choices": [{"index": 0, "message": message,
-                     "finish_reason": finish_reason or "stop",
-                     "logprobs": None}],
+        "choices": choices_out,
     }
     if usage is not None:
         out["usage"] = usage

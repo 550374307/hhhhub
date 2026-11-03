@@ -254,7 +254,14 @@ def _account_monitor(db: Session, scope_ids=None, platform: str = "") -> dict:
     order = {"breaker": 0, "disabled": 1, "cooling": 2, "no_balance": 3, "active": 4}
     items.sort(key=lambda item: (order.get(item["state"], 9), item["id"]))
     buckets["total"] = len(rows)
+    #: 出问题的号有多少个（前端「查看全部」要按这个数展示标题）
+    buckets["problem_total"] = sum(
+        1 for item in items if item["state"] != "active")
+    #: 本次响应是否被截断 —— 前端据此显示「查看全部」入口，
+    #: 而不是像以前那样静默丢掉 47 个问题号（用户完全不知道有这么多）。
     buckets["items"] = items[:60]
+    buckets["truncated"] = len(items) > 60
+    buckets["items_total"] = len(items)
     return buckets
 
 
@@ -454,3 +461,93 @@ def overview(days: int = Query(default=1, ge=1, le=30),
     }
     _cache_put(_ck, payload, _ttl_for(days))
     return payload
+
+
+#: 「问题账号」的状态集合（除 active 之外的一切异常态）
+_PROBLEM_STATES = ("breaker", "disabled", "cooling", "no_balance")
+
+
+@router.get("/problem-accounts")
+def problem_accounts(
+        state: str = Query(default="", description="按状态过滤，空=全部异常态"),
+        limit: int = Query(default=200, ge=1, le=1000),
+        offset: int = Query(default=0, ge=0),
+        request: Request = None,
+        _: bool = Depends(require_admin),
+        db: Session = Depends(get_db)):
+    """总览「问题账号」的完整列表（分页）。
+
+    ## 为什么需要这个接口
+
+    `/api/overview` 的 `monitor.items` 被截断到 60 条（那次聚合很贵），
+    而前端又只画前 6 条。线上 169 个账号里有 53 个问题号，用户实际只
+    看到 6 个 —— 另外 47 个**完全无从得知**，也没有任何入口能看到。
+
+    这个接口只查账号表（不碰 usage_logs），所以可以给全量分页。
+    前端「查看全部」按钮打这里。
+
+    参数
+    ----
+    state  : `breaker` / `disabled` / `cooling` / `no_balance` / 空（全部异常态）
+    limit  : 每页条数（默认 200，够一屏滚完）
+    offset : 偏移
+    """
+    from admin.models import Account
+    from admin.platform import registry as _registry
+
+    platform, realm = platform_scope.from_request(request)
+    q = db.query(Account)
+    if platform:
+        q = q.filter(func.lower(Account.platform) == platform.lower())
+    rows = q.all()
+
+    now = datetime.utcnow()
+    out = []
+    for acc in rows:
+        status = (acc.status or "")
+        breaker_until = getattr(acc, "breaker_until", None)
+        cool_until = getattr(acc, "cool_until", None)
+        balance = acc.balance_remain or 0
+        if status != "active":
+            st, label = "disabled", "已禁用"
+        elif breaker_until and breaker_until > now:
+            st, label = "breaker", "熔断中"
+        elif cool_until and cool_until > now:
+            st, label = "cooling", (acc.cool_kind or "冷却中")
+        elif balance <= 0:
+            st, label = "no_balance", "额度耗尽"
+        else:
+            continue  # 健康的不要
+        if state and st != state:
+            continue
+        until = breaker_until if (breaker_until and breaker_until > now) else cool_until
+        out.append({
+            "id": acc.id,
+            "name": acc.name or "",
+            "platform": acc.platform or _registry.DEFAULT_PLATFORM,
+            "domain": acc.domain or "",
+            "state": st,
+            "label": label,
+            "balance": int(balance),
+            "until": until.isoformat() + "Z"
+            if (until and until > now) else None,
+            "cool_remaining": int((until - now).total_seconds())
+            if (until and until > now) else 0,
+            "last_error": (acc.last_err_msg or "")[:120],
+            "uid": acc.uid or "",
+        })
+
+    order = {"breaker": 0, "disabled": 1, "cooling": 2, "no_balance": 3}
+    out.sort(key=lambda x: (order.get(x["state"], 9), x["id"]))
+    counts = {k: sum(1 for x in out if x["state"] == k) for k in _PROBLEM_STATES}
+    page = out[offset:offset + limit]
+    return {
+        "platform": platform,
+        "realm": realm,
+        "total": len(out),
+        "counts": counts,
+        "offset": offset,
+        "limit": limit,
+        "items": page,
+        "has_more": offset + len(page) < len(out),
+    }

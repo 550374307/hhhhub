@@ -1287,16 +1287,25 @@ async def _collect_stream(response: httpx.Response) -> dict:
     注意：上游会把思维链放在 delta.reasoning_content 里（实测 deepseek 系带
     reasoning_effort 时必吐）。早期版本只读 delta.content，导致非流式请求
     的思考内容被整段丢弃——这里显式保留。
+
+    ## 多候选（`n>1`）按 choice.index 分开累积
+
+    与 `admin/routers/proxy._aggregate_chat_sse` 同源（两处必须一致，
+    否则直连网关与后台网关对同一请求给出不同形状）。早期实现把所有
+    choice 的 content 拼进同一个列表、固定输出 `choices:[{index:0}]`，
+    于是 `n=2` 得到 `content: "候选A候选B"` —— 数量少一条且**内容串味**。
     """
-    content_parts: list[str] = []
-    reasoning_parts: list[str] = []
-    # tool_calls: index -> {id, name, arguments(分片拼接)}
-    tool_calls: dict[int, dict] = {}
+    #: choice.index -> 该候选的累加状态
+    slots: dict[int, dict] = {}
+
+    def slot_for(index: int) -> dict:
+        return slots.setdefault(index, {
+            "content": [], "reasoning": [], "tool_calls": {},
+            "finish_reason": None, "saw_content": False,
+        })
+
     model: str | None = None
-    finish_reason: str | None = None
     usage: dict | None = None
-    # 兼容上游偶发返回 message（而非 delta）的形态
-    saw_content_delta = False
 
     async for line in response.aiter_lines():
         line = line.strip()
@@ -1312,61 +1321,83 @@ async def _collect_stream(response: httpx.Response) -> dict:
         model = chunk.get("model") or model
         if chunk.get("usage"):
             usage = chunk["usage"]
-        for choice in chunk.get("choices") or []:
+        for pos, choice in enumerate(chunk.get("choices") or []):
+            # 上游可能不写 index：用它在本帧 choices 里的位次兜底
+            raw_index = choice.get("index")
+            try:
+                index = int(raw_index) if raw_index is not None else pos
+            except (TypeError, ValueError):
+                index = pos
+            slot = slot_for(index)
             if choice.get("finish_reason"):
-                finish_reason = choice["finish_reason"]
+                slot["finish_reason"] = choice["finish_reason"]
             delta = choice.get("delta") or {}
             if delta.get("content"):
-                content_parts.append(delta["content"])
-                saw_content_delta = True
+                slot["content"].append(delta["content"])
+                slot["saw_content"] = True
             # 思维链：与 content 同等对待，原样保留
             if delta.get("reasoning_content"):
-                reasoning_parts.append(delta["reasoning_content"])
+                slot["reasoning"].append(delta["reasoning_content"])
             # 兜底：上游非 delta 形态（只在从未收到 content delta 时）
             msg = choice.get("message") or {}
-            if not saw_content_delta and msg.get("content"):
-                content_parts.append(msg["content"])
-            if not reasoning_parts and msg.get("reasoning_content"):
-                reasoning_parts.append(msg["reasoning_content"])
+            if not slot["saw_content"] and msg.get("content"):
+                slot["content"].append(msg["content"])
+            if not slot["reasoning"] and msg.get("reasoning_content"):
+                slot["reasoning"].append(msg["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
-                slot = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+                bucket = slot["tool_calls"]
+                tc_slot = bucket.setdefault(
+                    idx, {"id": None, "name": None, "arguments": ""})
                 if tc.get("id"):
-                    slot["id"] = tc["id"]
+                    tc_slot["id"] = tc["id"]
                 fn = tc.get("function") or {}
                 if fn.get("name"):
-                    slot["name"] = fn["name"]
+                    tc_slot["name"] = fn["name"]
                 if fn.get("arguments"):
-                    slot["arguments"] += fn["arguments"]
+                    tc_slot["arguments"] += fn["arguments"]
 
-    tcs = None
-    if tool_calls:
-        tcs = [
-            {"id": v["id"], "type": "function",
-             "function": {"name": v["name"], "arguments": v["arguments"]}}
-            for _, v in sorted(tool_calls.items())
-        ]
-        finish_reason = finish_reason or "tool_calls"
+    if not slots:
+        slots[0] = {"content": [], "reasoning": [], "tool_calls": {},
+                    "finish_reason": None, "saw_content": False}
 
-    # 输出阶段（length 截断）剔除参数不完整的工具调用，避免客户端解析到半个 JSON
-    message = {"role": "assistant", "content": "".join(content_parts) or None}
-    if tcs:
-        message["tool_calls"] = tcs
-        if finish_reason == "length":
-            dropped = upstream_compat.drop_truncated_tool_calls(message)
-            if dropped:
-                tcs = message.get("tool_calls")
-                _log(f"剔除 {dropped} 个参数截断的 tool_call（finish_reason=length）")
-    reasoning = "".join(reasoning_parts)
-    if reasoning:
-        message["reasoning_content"] = reasoning
+    choices_out = []
+    for index in sorted(slots):
+        slot = slots[index]
+        finish_reason = slot["finish_reason"]
+        tcs = None
+        if slot["tool_calls"]:
+            tcs = [
+                {"id": v["id"], "type": "function",
+                 "function": {"name": v["name"], "arguments": v["arguments"]}}
+                for _, v in sorted(slot["tool_calls"].items())
+            ]
+            finish_reason = finish_reason or "tool_calls"
+
+        # 输出阶段（length 截断）剔除参数不完整的工具调用，
+        # 避免客户端解析到半个 JSON。按候选各自判断。
+        message = {"role": "assistant",
+                   "content": "".join(slot["content"]) or None}
+        if tcs:
+            message["tool_calls"] = tcs
+            if finish_reason == "length":
+                dropped = upstream_compat.drop_truncated_tool_calls(message)
+                if dropped:
+                    tcs = message.get("tool_calls")
+                    _log(f"剔除 {dropped} 个参数截断的 tool_call"
+                         f"（finish_reason=length, index={index}）")
+        reasoning = "".join(slot["reasoning"])
+        if reasoning:
+            message["reasoning_content"] = reasoning
+        choices_out.append({"index": index, "message": message,
+                            "finish_reason": finish_reason or "stop"})
+
     return {
         "id": "chatcmpl-" + os.urandom(12).hex(),
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model or "unknown",
-        "choices": [{"index": 0, "message": message,
-                     "finish_reason": finish_reason or "stop"}],
+        "choices": choices_out,
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 

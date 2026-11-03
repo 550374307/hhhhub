@@ -18,8 +18,26 @@ def display_options(db):
         value = {}
     if not isinstance(value, dict):
         value = {}
-    return {key: value.get(key) is not False
-            for key in ("show_multiplier", "show_busy", "official_only")}
+    options = {}
+    for key in ("show_multiplier", "show_busy"):
+        # 这两项缺省为「开」：展示信息越全越好
+        options[key] = value.get(key) is not False
+    # ⚠️ `official_only` 缺省为 **关**（`False`），与另外两项相反。
+    #
+    # 它开着时，明细视图只显示"官方前端当前可见"的模型 —— 实测本机
+    # 82 条里有 40 条被隐藏（WorkBuddy 的旧模型）。问题在于：
+    #
+    #   · 这 40 个模型在界面上**完全不可见**，而启停按钮只在明细视图里，
+    #     等于用户没法启用/禁用它们（不是"看不到状态"，是"没法操作"）
+    #   · 默认值是 true 且没有任何提示，用户根本不知道少了 40 条
+    #   · 聚合视图（首屏默认）却显示全部 69 组 —— 两个视图口径不一致，
+    #     用户点一下"平铺"就莫名其妙少了 40 条，且选择会被 localStorage 记住
+    #
+    # 改成缺省关闭后：默认看得到全部模型（可操作），想只看官方可见的
+    # 用户可以手动打开那个开关。**显式配置过的值仍然尊重**——
+    # 只有"从未设置过"才用新默认。
+    options["official_only"] = value.get("official_only") is True
+    return options
 
 
 def official_order(db) -> list[str]:
