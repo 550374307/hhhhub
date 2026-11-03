@@ -213,7 +213,7 @@ def request_json(method: str, url: str, *, token: str, realm: str = "cn",
     所以：`message` 只放**不含上游原文**的短句，上游原文放 `detail`
     （只进日志，由 `_fail` 控制）。这与 loomy 的约定一致。
     """
-    headers = endpoints.auth_headers(token)
+    headers = endpoints.auth_headers(token, realm)
     if json_body is not None:
         headers["Content-Type"] = "application/json"
     tag = "raccoon#%s" % (account_id if account_id is not None else "-")
@@ -344,7 +344,7 @@ def open_stream(url: str, *, token: str, realm: str = "cn", json_body=None,
     上游要先看首帧：如果第一行就是 `{"code": 401xx}` 的信封错误，
     必须在**开始转发之前**就抛出来，否则客户端会收到一个「200 + 空流」。
     """
-    headers = endpoints.auth_headers(token)
+    headers = endpoints.auth_headers(token, realm)
     headers["Content-Type"] = "application/json"
     headers["Accept"] = "text/event-stream"
     client_obj = httpx.Client(timeout=TIMEOUT, follow_redirects=True)

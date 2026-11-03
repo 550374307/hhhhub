@@ -26,6 +26,7 @@
 """
 from __future__ import annotations
 
+import os
 import secrets
 
 PLATFORM = "loomy"
@@ -58,6 +59,32 @@ CRED_FILE = "auth-session.json"
 OPENCODE_CONFIG = "opencode/opencode.json"
 
 
+#: 默认 UA：Electron 内嵌 Chromium 的形态。
+#:
+#: ## 为什么 loomy 也要设 UA（尽管它不校验）
+#:
+#: Loomy 客户端是 Electron 应用（`admin/platform/skill/CASE-LOOMY.md` 的
+#: 解包结论：as.ar 拆分、`config-path.js`、`electron-store`）。官方客户端
+#: 走 Electron 内嵌 Chromium，**不发自定义 UA**，所以发出去的是 Chromium
+#: 的默认 UA —— 而不是 `Python-urllib/3.12`。
+#:
+#: 用无效 token 做对照实验（`/models`，四种 UA）：业务响应码一字不差
+#: （都是 200 + code=100002）。所以 **UA 不影响鉴权**。
+#: 但在真实流量里，`Python-urllib/3.12` 是最典型的脚本特征；本平台同样
+#: 是批量导入账号，被整体标记的代价远大于这里改一行的成本。
+#:
+#: 因此发一个与 Electron 客户端一致的 UA。环境变量 `ADMIN_LOOMY_UA` 可覆盖。
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Loomy/1.0.0 Chrome/128.0.6613.186 "
+              "Electron/32.0.0 Safari/537.36")
+
+
+def user_agent() -> str:
+    """当前应使用的 UA（`ADMIN_LOOMY_UA` 可覆盖）。"""
+    value = (os.getenv("ADMIN_LOOMY_UA") or "").strip()
+    return value or DEFAULT_UA
+
+
 def auth_headers(token: str, version: str = "1.0.0") -> dict:
     """鉴权头。
 
@@ -71,6 +98,7 @@ def auth_headers(token: str, version: str = "1.0.0") -> dict:
         "traceparent": "00-%s-%s-01" % (secrets.token_hex(16),
                                         secrets.token_hex(8)),
         "loomy-version": version,
+        "User-Agent": user_agent(),
     }
 
 
@@ -79,8 +107,12 @@ def points_headers(token: str) -> dict:
 
     ⚠️ 与 chat 链路不同：**只带 `token`**，不带 `Authorization`。
     实测带 Bearer 也能通，但官方只发这一个头，保持一致最稳。
+
+    UA 仍要带：积分接口与 chat 走同一个网关，没有理由在这里露出
+    `Python-urllib` 而 chat 不露。
     """
-    return {"token": token, "Accept": "application/json"}
+    return {"token": token, "Accept": "application/json",
+            "User-Agent": user_agent()}
 
 
 def base_of(realm: str) -> str:
