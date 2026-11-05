@@ -33,8 +33,8 @@ class InviteCreateIn(BaseModel):
     note: str = Field(default="", max_length=200)
     #: 最大可用次数（默认 1，即一次性）。
     max_uses: int = Field(default=1, ge=1, le=1000)
-    #: 有效天数（默认 7，上限 90）。
-    valid_days: int = Field(default=7, ge=1, le=90)
+    #: 有效天数（默认 7，上限 7 —— 与 join_invite._MAX_VALID_DAYS 一致）。
+    valid_days: int = Field(default=7, ge=1, le=7)
 
 
 @router.get("")

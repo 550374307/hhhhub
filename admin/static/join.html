@@ -287,12 +287,15 @@
     });
   }
 
-  // 邀请码：从 URL 查询参数预填（带码分享链接），用户也可手动改。
+  // 邀请码：**不再从 URL 查询参数预填**。
+  //
+  // `?invite_code=MH-xxxx` 会原样进 nginx access log、浏览器历史、Referer，
+  // 以及任何拿到这条链接的人都能读到的书签 —— 等于把一张可用凭证写在日志里。
+  // 服务端已同步删掉 query 分支（admin/routers/login.py:_extract_invite_code），
+  // 所以这里预填也没有意义：填了也过不了校验。
+  //
+  // 分享请用请求体字段或 `X-Join-Invite` 头；前端仍保留输入框供手动粘贴。
   var INVITE = "";
-  try {
-    var q = new URLSearchParams(location.search);
-    INVITE = (q.get("invite_code") || q.get("invite") || "").trim();
-  } catch (e) { INVITE = ""; }
 
   function inviteValue() {
     var el = $("inviteCode");
