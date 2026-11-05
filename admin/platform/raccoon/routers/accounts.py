@@ -263,10 +263,31 @@ def usage(realm: str = "", days: int = 30, _: bool = Depends(require_admin),
 
 @router.get("/scan-local")
 def scan_local(_: bool = Depends(require_admin)):
-    """明确告知不支持本机扫描（而不是返回空列表）。"""
+    """扫描本机客户端登录态。
+
+    凭证是**明文** `auth.json`（`BOX_AGENT_CONFIG_DIR` 或
+    `~/.office-raccoon/agent/config/`），不是 Electron LevelDB ——
+    旧注释里那个结论已被 `services/scan.py` 的逆向证据推翻。
+    """
     from admin.platform.raccoon.platform_gateway import RaccoonAccountOps
 
     return RaccoonAccountOps("").scan()
+
+
+class ImportLocalIn(BaseModel):
+    """本机导入：`uids` 为空表示全部导入。"""
+    uids: list[str] | None = None
+
+
+@router.post("/import-local")
+def import_local(body: ImportLocalIn | None = None,
+                 _: bool = Depends(require_admin),
+                 db: Session = Depends(get_db)):
+    """把扫描到的本机凭证入库（扫描 → 勾选 → 确认）。"""
+    from admin.platform.raccoon.platform_gateway import RaccoonAccountOps
+
+    uids = (body.uids if body is not None else None) or []
+    return RaccoonAccountOps("").import_local(db, uids=uids)
 
 
 @router.get("/checkin")

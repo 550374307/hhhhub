@@ -22,11 +22,14 @@
 
 ## 凭证从哪来
 
-小浣熊客户端用 Electron LevelDB 存登录态，不是明文 JSON，且不是每台机器都装。
-所以本平台**没有本机扫描**（`supports_local_scan=False`），凭证靠导入：
-agent2api 导出的 `agent2api-account` JSON / 裸 JWT / 原生对象都接受。
+**优先从本机客户端扫描**（`supports_local_scan=True`）。客户端主进程
+`build/electron/main/agent/boxAgentAuthFile.js` 把凭证写在明文的
+`auth.json`（`BOX_AGENT_CONFIG_DIR` 或 `~/.office-raccoon/agent/config/`），
+不是 Electron LevelDB —— 之前那个「扫不出来」的结论是误判，已由
+`services/scan.py` 推翻并实现。
 
-该「明确不支持」要好过「假装能扫然后返回空」——后者会让用户以为客户端没登录。
+同时仍支持导入：agent2api 导出的 `agent2api-account` JSON / 裸 JWT /
+原生对象都接受，用于客户端没装或用其他机器登录的场景。
 """
 from __future__ import annotations
 
@@ -75,26 +78,27 @@ def install() -> None:
             label="小浣熊",
             realms=(),
             enabled=True,
-            # 凭证来自导入（Electron LevelDB，非明文），不做本机扫描
-            supports_local_scan=False,
-            # **关键**：既无本机明文凭证、也无授权登录接口。
+            # 凭证优先来自本机客户端扫描（明文 auth.json，见 services/scan.py）；
+            # 客户端没装时仍可用导入。
+            supports_local_scan=True,
+            # 既无「授权登录」接口（不扫码），扫描之外只能导入。
             # 不声明这一项，控制台会按「不支持扫描 ⇒ 一定有设备授权」
             # 强制注入 begin-auth（→ /api/raccoon/device/start 404），
             # 同时把 import 剔除，结果这个平台的账号**永远加不进来**。
-            auth_mode="import-only",
+            auth_mode="local-scan",
             gateway="admin.platform.raccoon.gateway",
             platform_gateway="admin.platform.raccoon.platform_gateway:RaccoonGateway",
             storage_platform=PLATFORM,
             realm=realm,
             icon="raccoon",
-            notes="小浣熊（xiaohuanxiong.com）：Bearer JWT，积分制；凭证靠导入，无本机扫描",
+            notes="小浣熊（xiaohuanxiong.com）：Bearer JWT，积分制；本机 auth.json 可直接扫描",
             extra={
                 "task_runners": list(_task_runners().keys()),
                 # 只声明契约词表内的动作（scan / import / refresh-quota /
                 # usage / web-cookie / checkin / begin-auth）。
                 # `export` 不在词表里 —— 声明了前端会渲染出一个点了没反应的
                 # 英文按钮，导出能力改由 /api/raccoon/export 直接调用。
-                "actions": ["import", "refresh-quota"],
+                "actions": ["scan", "import", "refresh-quota"],
             },
         ))
         logger.debug("小浣熊平台已登记：%s", platform_id)

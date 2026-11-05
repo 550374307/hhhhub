@@ -81,29 +81,82 @@ class RaccoonAccountOps:
         return {"items": views, "summary": raccoon_accounts.summarize(views)}
 
     def scan(self):
-        """本机扫描：不支持。
+        """本机扫描：读客户端明文的 auth.json。
 
-        返回结构保持与支持扫描的平台一致（`items` 为空 + `supported`），
-        这样前端「扫描本机」按钮点下去能得到一句人话解释，而不是空列表。
+        ## 为什么之前写着「不支持」
+
+        旧实现的结论是「小浣熊登录态存在 Electron LevelDB 中，不是明文文件，
+        无法直接扫描」。那是**误判** —— 逆向客户端主进程
+        `build/electron/main/agent/boxAgentAuthFile.js` 可见：
+
+            authPath = BOX_AGENT_CONFIG_DIR
+                       or resolveBoxAgentHome(homedir)/config/auth.json
+
+        客户端启动时把 `BOX_AGENT_HOME` 指到自己的 profile 目录，实测是
+        `<user>/.office-raccoon/agent/config/auth.json`，内容是**明文 JSON**。
+        也就是说凭证根本不在 LevelDB 里。
+
+        现在直接读它（`scan.discover()` 只回脱敏 uid，不含 token）。
         """
-        return {
-            "supported": False,
-            "items": [],
-            "data_dirs": [],
-            "reason": "electron_leveldb",
-            "summary": "小浣熊登录态存在 Electron LevelDB 中，不是明文文件，无法直接扫描",
-            "hint": "请在 agent2api 中登录后导出账号 JSON，再用「导入」批量添加；"
-                    "或直接粘贴 JWT。",
-        }
+        from admin.platform.raccoon.services import scan as raccoon_scan
 
-    def import_local(self, db):
-        """本机导入：与 scan 同理，不支持。"""
-        return {
-            "supported": False,
-            "imported": 0,
-            "reason": "electron_leveldb",
-            "hint": "请使用「导入凭证」粘贴 agent2api 导出的 JSON 或裸 JWT。",
-        }
+        try:
+            found = raccoon_scan.discover()
+        except Exception as exc:  # noqa: BLE001 - 扫描失败不该 500
+            _logger.warning("小浣熊本机扫描失败: %s", exc)
+            return {
+                "supported": True,
+                "items": [],
+                "data_dirs": [],
+                "reason": "scan_error",
+                "hint": "扫描失败：%s。可直接用「导入凭证」粘贴明文 JSON 或裸 JWT。" % exc,
+            }
+        found["supported"] = True
+        return found
+
+    def import_local(self, db, uids=None):
+        """把扫描到的本机凭证入库。
+
+        `uids` 是前端勾选的 uid（脱敏值或完整值都认）；为空表示全部导入。
+
+        注意 `scan.discover()` **不含 token**（它是给界面展示用的），
+        真正入库要调 `scan.read_credentials()` —— 后者返回
+        `normalize_record` 可直接消费的形状。
+        """
+        from admin.platform.raccoon.services import scan as raccoon_scan
+
+        try:
+            found = raccoon_scan.discover()
+        except Exception as exc:  # noqa: BLE001
+            return {"supported": True, "imported": 0, "reason": "scan_error",
+                    "hint": "扫描失败：%s" % exc}
+
+        wanted = {str(u).strip().lower() for u in (uids or []) if str(u).strip()}
+        if wanted:
+            hit = [it for it in (found.get("items") or [])
+                   if isinstance(it, dict)
+                   and (str(it.get("uid") or "").lower() in wanted
+                        or str(it.get("uid_full") or "").lower() in wanted)]
+            if not hit:
+                return {
+                    "supported": True, "imported": 0, "reason": "not_selected",
+                    "hint": "勾选的账号不在本次扫描结果里，请重新扫描。",
+                }
+
+        cred = raccoon_scan.read_credentials()
+        if not cred:
+            return {
+                "supported": True, "imported": 0, "reason": "no_local_credentials",
+                "hint": found.get("hint") or "未发现本机小浣熊登录态，请先在客户端登录。",
+            }
+        try:
+            result = raccoon_accounts.import_many(db, [cred])
+        except Exception as exc:  # noqa: BLE001 - 单条导入失败要说清原因
+            _logger.warning("小浣熊本机导入失败: %s", exc)
+            return {"supported": True, "imported": 0, "reason": "import_error",
+                    "hint": "导入失败：%s" % exc}
+        result.update({"supported": True, "reason": ""})
+        return result
 
     def import_record(self, db, record):
         """导入单条。返回 `(账号, 是否新建)`（契约要求）。"""
