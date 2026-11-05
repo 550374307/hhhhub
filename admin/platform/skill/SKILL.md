@@ -33,6 +33,10 @@ description: 多平台网关的架构规范与接入指南。当需要新增一�
 | 任务/签到/保活 | [ACTIONS-AND-TASKS.md](ACTIONS-AND-TASKS.md) |
 | 计费/倍率 | [BILLING.md](BILLING.md) |
 | 能力矩阵 | [CAPABILITY-MATRIX.md](CAPABILITY-MATRIX.md) |
+| **模型名被 400「不存在」/ 平台后缀路由** | [PROTOCOL-ROUTING-CACHE.md](PROTOCOL-ROUTING-CACHE.md) — dispatch 的七步链路，第⑤步最容易漏 |
+| **改请求体被上游拒（11128 / role / 指纹）** | [REQUEST-BODY-CONTRACT.md](REQUEST-BODY-CONTRACT.md) — 请求体规则是平台私有契约 |
+| **凭证获取/续期/失效/禁用** | [CREDENTIAL-LIFECYCLE.md](CREDENTIAL-LIFECYCLE.md) — 生命周期纪律 + 各平台差异 |
+| **并发该开多少 / 账号数怎么配** | [CAPACITY-PLANNING.md](CAPACITY-PLANNING.md) — 真实压测数据 |
 
 > **⚠️ 改动任何代码前，先扫一遍 [FIXED-BUGS.md](FIXED-BUGS.md)。**
 > 那份文档记录了 **30 余条真实 bug**（其中 14 条是「五·补」系列的新增踩坑），
