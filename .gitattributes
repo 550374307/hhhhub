@@ -1,0 +1,64 @@
+# 统一行尾：仓库内一律 LF
+#
+# ## 为什么需要这个文件
+#
+# `fba4f81` 全仓是 LF，但之后几个提交（`a64f263` / `49f514e` / `5c7c762`）
+# 把 19+ 个文件转成了 CRLF 并**提交进 blob**。后果是 `git diff --stat`
+# 全面失真：
+#
+#     本仓 vs fba4f81：名义 86,356 行 → 忽略 CR 后 5,808 行（14.9 倍噪音）
+#     上游 vs fba4f81：名义 51,827 行 → 忽略 CR 后 51,819 行（1.0 倍）
+#
+# 最典型的受害者是 `admin/platform/dispatch.py`：`--stat` 说 2704 行，
+# **真实改动只有 5 行**（异常脱敏）。任何按 stat 判断冲突风险的人都会
+# 全面误判，所有 `git cherry-pick` / `git apply` 都会变成伪全文件冲突。
+#
+# ## 生效方式
+#
+# `* text=auto eol=lf` 让 git 在**入库时**统一成 LF；工作区按平台
+# （Windows 仍是 CRLF，不影响编辑器体验）。已有的 CRLF blob 需要一次
+# 显式 renormalize 才会被改写：
+#
+#     git add --renormalize .
+#     git commit -m "chore(eol): 统一行尾为 LF"
+#
+# 之后 `git diff --stat` 与 `git diff --ignore-cr-at-eol --stat` 应当
+# 数量级一致 —— 这是判断有没有踩坑的最快方式。
+#
+# ## 例外
+#
+# 二进制与已带 CRLF 语义的文件不参与转换。
+* text=auto eol=lf
+
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.webp binary
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.otf  binary
+*.exe  binary
+*.dll  binary
+*.so   binary
+*.dylib binary
+*.apk  binary
+*.aab  binary
+*.zip  binary
+*.7z   binary
+*.gz   binary
+*.pdf  binary
+*.db   binary
+*.sqlite binary
+*.pyc  binary
+
+# Windows 批处理必须保持 CRLF，否则 cmd.exe 解析换行会出问题。
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# 保持原样（避免第三方脚本的换行被改写）。
+*.lua   text eol=lf
+*.sh    text eol=lf
