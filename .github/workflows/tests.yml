@@ -1,0 +1,86 @@
+name: Tests
+
+# 触发方式
+#   1) 推送到任意分支 / 发 PR  -> 只跑测试（快，2~3 分钟）
+#   2) 手动 workflow_dispatch  -> 同上
+#
+# 为什么单独一个 workflow：
+#   `desktop-release.yml` 只在**推 tag** 或手动派发时触发，所以日常提交、
+#   PR、分支推送**根本不会跑任何检查** —— 测试写了也没人执行。
+#   发版流程保持不动（它要跑 PyInstaller/Gradle，慢且只该在发版时跑），
+#   这里只做「语法 + 单元/回归测试」，任何分支任何提交都跑。
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # 同一分支的新推送取消上一轮，避免堆积
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 发版用的是 3.10（见 desktop-release.yml 的 PYTHON_VERSION），
+        # 这里同时覆盖 3.10 与本机开发用的 3.12，避免"本机能跑 CI 不能跑"。
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte-compile every tracked Python file
+        shell: pwsh
+        run: |
+          $failed = @()
+          foreach ($f in (git ls-files '*.py')) {
+            python -m py_compile $f 2>$null
+            if ($LASTEXITCODE -ne 0) { $failed += $f }
+          }
+          if ($failed.Count -gt 0) {
+            Write-Host "compile failures:"
+            $failed | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Write-Host "all Python files compiled"
+
+      - name: Import the app (catches broken imports early)
+        shell: pwsh
+        env:
+          # 没有真实部署环境，用固定弱密钥让 config 不要 fail-closed。
+          # 这一步只验证「模块能被导入」，不启动服务、不连数据库。
+          ADMIN_ALLOW_INSECURE_DEFAULT: '1'
+        run: python -c "import admin.server; print('import ok')"
+
+      - name: Protocol bridge tests
+        shell: pwsh
+        env:
+          ADMIN_ALLOW_INSECURE_DEFAULT: '1'
+        run: |
+          python -I tests/test_protocol_bridge.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Absorb regressions
+        shell: pwsh
+        env:
+          ADMIN_ALLOW_INSECURE_DEFAULT: '1'
+        run: |
+          python -I tests/test_absorb_regressions.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
