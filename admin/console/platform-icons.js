@@ -62,6 +62,10 @@
   /* ---- 位图（只有 ico 的平台） ---- */
   var RASTER = {
     loomy: { src: "/admin/assets/logos/loomy-256.png", tone: "color" },
+    // 小浣熊：素材取自客户端 `resources/assets/menu-bar-raccoon.png`
+    raccoon: { src: "/admin/assets/logos/raccoon-256.png", tone: "color" },
+    // CodeArts：素材取自客户端 `resources/build/icon.png`（512×512 RGBA）
+    codearts: { src: "/admin/assets/logos/codearts-256.png", tone: "color" },
   };
 
   /* 兜底：不要用「加号」（看着像「新建平台」）。 */
@@ -87,6 +91,12 @@
     loomy: "loomy",
     "loomy-cn": "loomy",
     "loomy-intl": "loomy",
+    // 小浣熊只有一个区域（国内站）
+    raccoon: "raccoon",
+    "raccoon-cn": "raccoon",
+    // CodeArts 只有一个区域（华为云 cn-north-4）
+    codearts: "codearts",
+    "codearts-cn": "codearts",
   };
 
   function resolve(id) {
