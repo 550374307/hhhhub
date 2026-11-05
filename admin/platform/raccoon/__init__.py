@@ -98,7 +98,13 @@ def install() -> None:
                 # usage / web-cookie / checkin / begin-auth）。
                 # `export` 不在词表里 —— 声明了前端会渲染出一个点了没反应的
                 # 英文按钮，导出能力改由 /api/raccoon/export 直接调用。
-                "actions": ["scan", "import", "refresh-quota"],
+                #
+                # `begin-auth` = 扫码授权。注意它是**备用入口**：上游实测
+                # 扫码会话常返回 200901（未完成 IAM 确认），业务接口不可用；
+                # 首选仍是「扫描本机」（客户端已登录时凭证是好的）。
+                # 但把它列出来是有必要的 —— 没装客户端的人至少还有一条路，
+                # 失败时也能得到明确原因而不是「这个平台加不了号」。
+                "actions": ["scan", "import", "begin-auth", "refresh-quota"],
             },
         ))
         logger.debug("小浣熊平台已登记：%s", platform_id)

@@ -14,3 +14,7 @@ cryptography
 python-dotenv
 # 版本检查（浏览器后台与桌面版共用）
 packaging>=24.0
+
+# 小浣熊扫码授权（admin/platform/raccoon/services/webauth.py）生成二维码 SVG。
+# 纯 Python，无 C 扩展；SVG 输出不需要 pillow。
+qrcode>=8.0

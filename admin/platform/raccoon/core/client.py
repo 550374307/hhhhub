@@ -39,6 +39,25 @@ _QUOTA_CODES = {402, 40201, 40202, 40203}
 _RATE_CODES = {429, 42901, 42902}
 _MODEL_CODES = {404, 40401, 4023}
 
+#: `200901 iam_confirm_required` —— **扫码授权拿到的会话还没被确认**。
+#:
+#: 实测：同一个 JWT 打 `/model_catalog`、`/points/balance`、
+#: `/entitlement_info` 一律返回
+#: `400 {"code":200901,"message":"iam_confirm_required"}`；
+#: 而客户端 `auth.json` 里那张票（另一个 `sid`）同样的请求是 200。
+#: 也就是说**扫码得到的 IAM 会话缺一步确认，业务接口全部不可用**。
+#:
+#: 为什么不能归进 `_AUTH_CODES`：那会让 `sync_quota` 把它当「凭证失效」直接
+#: `disabled`，而这其实是「换个入口取凭证」就能解决的事 —— 禁用反而让用户
+#: 更难理解（账号还在、就是刷不出余额）。
+_CONFIRM_CODES = {200901}
+
+
+def _confirm_hint() -> str:
+    """`iam_confirm_required` 给人看的解释（两处错误分支共用）。"""
+    return ("登录会话未完成 IAM 确认（上游 200901）：扫码得到的会话不能直接调接口，"
+            "请在小浣熊客户端登录后用「扫描本机 / 导入文件」入库")
+
 
 def _redact(text: str, limit: int = 500) -> str:
     """把可能承载凭证的片段打码，再截断。
@@ -135,6 +154,10 @@ def _classify(code: int | None, status: int, message: str) -> str:
 
     所以这里只认**明确的鉴权语义**，不用裸 `token` 子串。
     """
+    # `iam_confirm_required` 必须**先于** auth 判定：它不是凭证失效，
+    # 归成 auth 会让 sync_quota 把健康号 disabled（见 _CONFIRM_CODES 注释）。
+    if code in _CONFIRM_CODES or "iam_confirm_required" in str(message or "").lower():
+        return "confirm"
     if code in _AUTH_CODES or status in (401, 403):
         return "auth"
     if code in _QUOTA_CODES or status == 402:

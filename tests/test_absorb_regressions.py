@@ -326,6 +326,122 @@ def _():
 
 
 # --------------------------------------------------------------------------
+# 9. raccoon 扫码授权（含 200901 保护）
+# --------------------------------------------------------------------------
+@check("raccoon: 200901 归 confirm，不归 auth")
+def _():
+    from admin.platform.raccoon.core import client as c
+
+    assert c._classify(200901, 400, "iam_confirm_required") == "confirm"
+    assert c._classify(200901, 400, "") == "confirm"
+    # 关键：不能进 auth —— 那会让 sync_quota 把健康号 disabled
+    assert 200901 not in c._AUTH_CODES
+    assert 200901 in c._CONFIRM_CODES
+    # 相邻分类不受影响
+    assert c._classify(401, 401, "") == "auth"
+    assert c._classify(402, 402, "") == "quota"
+
+
+@check("raccoon: qr_svg 生成合法 SVG")
+def _():
+    from admin.platform.raccoon.services import webauth as w
+
+    svg = w.qr_svg("https://example.com/x?code=1")
+    assert svg.lstrip().startswith("<svg"), svg[:40]
+    assert len(svg) > 500, len(svg)
+
+
+@check("raccoon: 扫码会话可用才入库，200901 必须拒绝")
+def _():
+    """两条路径都要验：可用 -> 入库；200901 -> 不入库且标记 confirm_required。
+
+    这是本轮最危险的一处：直接入库会把**能用的凭证覆盖成不能用的**，
+    而用户只会看到「授权成功了却什么都用不了」。
+    """
+    import base64
+    import time as _t
+
+    def b64(o):
+        return base64.urlsafe_b64encode(json.dumps(o).encode()).decode().rstrip("=")
+
+    def jwt(sub):
+        return "%s.%s.%s" % (
+            b64({"alg": "HS256", "typ": "JWT"}),
+            b64({"iss": "https://xiaohuanxiong.com/iam", "sub": sub,
+                 "exp": int(_t.time()) + 86400}), "sig")
+
+    class Resp:
+        def __init__(self, payload):
+            self._r = json.dumps(payload).encode()
+
+        def read(self):
+            return self._r
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    import admin.platform.raccoon.services.accounts as raccoon_accounts
+    import admin.platform.raccoon.services.webauth as w
+    from admin.platform.raccoon.core import client as raccoon_client
+
+    real_urlopen = w.urllib.request.urlopen
+    real_fetch = raccoon_client.fetch_models
+    real_import = raccoon_accounts.import_record
+
+    class FakeDB:
+        def commit(self):
+            pass
+
+    def scenario(mode):
+        token = jwt("pu-test-" + mode)
+        imported = {}
+
+        def fake_urlopen(req, timeout=None):
+            url = getattr(req, "full_url", str(req))
+            if "/auth/mp/qrcode/login" in url:
+                return Resp({"code": "OK",
+                             "data": {"status": "success", "access_token": token}})
+            return Resp({"code": "OK",
+                         "data": {"qrcode_code": "C-" + mode,
+                                  "expires_in": 300, "poll_interval": 2}})
+
+        def fake_fetch(tok, realm="cn", account_id=None):
+            if mode == "confirm":
+                raise raccoon_client.UpstreamError(
+                    status=400, message="iam_confirm_required",
+                    kind="confirm", code=200901)
+            return [{"id": "m1"}]
+
+        def fake_import(db, record):
+            imported.update(record)
+            return (object(), True)
+
+        w.urllib.request.urlopen = fake_urlopen
+        raccoon_client.fetch_models = fake_fetch
+        raccoon_accounts.import_record = fake_import
+        try:
+            begin = w.begin()
+            out = w.poll(FakeDB(), begin["auth_id"])
+            return out, imported
+        finally:
+            w.urllib.request.urlopen = real_urlopen
+            raccoon_client.fetch_models = real_fetch
+            raccoon_accounts.import_record = real_import
+
+    ok_out, ok_imported = scenario("ok")
+    assert ok_out.get("status") == "done", ok_out
+    assert ok_imported.get("token"), "可用会话应入库"
+
+    bad_out, bad_imported = scenario("confirm")
+    assert bad_out.get("status") == "failed", bad_out
+    assert bad_out.get("confirm_required") is True, bad_out
+    assert not bad_imported, "200901 的会话绝不能入库"
+
+
+# --------------------------------------------------------------------------
 def _say(text):
     """打印一行。编码不支持时退化成 ASCII 安全形式，绝不让编码问题影响判定。"""
     try:

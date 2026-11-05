@@ -6608,6 +6608,95 @@ async function platformBeginAuth(spec, storage) {
     return;
   }
 
+  // ---- 扫码授权（目前只有小浣熊）----
+  //
+  // 与设备流不同：这里**不需要用户点链接**，直接展示二维码让手机扫。
+  // 二维码内容由后端 `/auth/begin` 返回（`qr_value`），图片走
+  // `/auth/qr.svg?auth_id=…`（服务端渲染，前端不引 QR 库）。
+  //
+  // ⚠️ 上游实测：扫码拿到的 IAM 会话常返回 `200901 iam_confirm_required`，
+  // 业务接口全部不可用。后端在入库前会先探一次目录，不通就不落库并回
+  // `confirm_required=true` —— 这里要据此给出**可操作**的提示，
+  // 而不是笼统的「授权失败」。
+  if (id.startsWith("raccoon")) {
+    let begin;
+    try {
+      begin = await api("/api/raccoon/auth/begin", { method: "POST" });
+    } catch (e) {
+      toast("开始扫码失败：" + (e && e.message ? e.message : e), "err");
+      return;
+    }
+    const bj = await safeJson(begin);
+    if (!bj.ok || !bj.data || !bj.data.auth_id) {
+      toast("开始扫码失败：" + ((bj.data && bj.data.detail) || "无 auth_id"), "err");
+      return;
+    }
+    const authId = bj.data.auth_id;
+    const qrUrl = "/api/raccoon/auth/qr.svg?auth_id=" + encodeURIComponent(authId);
+    openModal(`<h3 class="font-semibold text-lg mb-2">扫码登录 · ${esc((spec && spec.label) || storage)}</h3>
+      <p class="text-sm text-slate-500 mb-3">用手机小浣熊 App 扫码。二维码由官方授权服务生成，有效期约 5 分钟。</p>
+      <div class="flex justify-center mb-3"><img src="${qrUrl}" alt="二维码" style="width:220px;height:220px;background:#fff;padding:8px;border-radius:8px"></div>
+      <p id="raccoonAuthMsg" class="text-sm text-slate-500">等待扫码…</p>`);
+
+    let stopped = false;
+    const stop = () => {
+      stopped = true;
+      try { fetch("/api/raccoon/auth/cancel?auth_id=" + encodeURIComponent(authId),
+                 { method: "POST", credentials: "same-origin" }); } catch (e) { /* 忽略 */ }
+    };
+    const el = $("raccoonAuthMsg");
+    const tick = async () => {
+      if (stopped) return;
+      let poll;
+      try {
+        poll = await api("/api/raccoon/auth/poll?auth_id=" + encodeURIComponent(authId));
+      } catch (e) {
+        if (el) el.textContent = "轮询失败：" + (e && e.message ? e.message : e);
+        return;
+      }
+      const { ok, data } = await safeJson(poll);
+      const st = (data && data.status) || "";
+      if (ok && st === "done") {
+        stopped = true;
+        if (el) { el.textContent = "授权成功，账号已入库"; el.style.color = "var(--success)"; }
+        toast("扫码登录成功");
+        setTimeout(() => location.reload(), 900);
+        return;
+      }
+      if (ok && st === "failed") {
+        stopped = true;
+        if (data && data.confirm_required) {
+          if (el) {
+            el.innerHTML = "扫码成功，但该会话未完成 IAM 确认（上游 200901），"
+              + "不能直接调接口。<br>请在小浣熊客户端登录后改用「扫描本机」或「导入」——"
+              + "客户端里的凭证是好的。";
+            el.style.color = "var(--danger)";
+          }
+        } else if (el) {
+          el.textContent = "授权失败：" + ((data && data.error) || "未知原因");
+          el.style.color = "var(--danger)";
+        }
+        return;
+      }
+      if (ok && (st === "expired" || st === "canceled")) {
+        stopped = true;
+        if (el) { el.textContent = st === "expired" ? "二维码已过期，请重新发起" : "已取消"; }
+        return;
+      }
+      if (el) el.textContent = st === "logging" ? "已扫码，请在手机上确认…" : "等待扫码…";
+      setTimeout(tick, Math.max(1, Number((data && data.poll_interval) || 2)) * 1000);
+    };
+    setTimeout(tick, 1500);
+    // 关掉弹窗时撤销会话，避免服务端堆无用 session
+    document.addEventListener("click", function once(ev) {
+      if (ev.target && ev.target.closest && ev.target.closest(".modal-close,[data-close-modal]")) {
+        stop();
+        document.removeEventListener("click", once);
+      }
+    });
+    return;
+  }
+
   const start = await api(`/api/${storage}/device/start?realm=${encodeURIComponent(realm)}`,
                           { method: "POST" });
   const { ok, data } = await safeJson(start);
