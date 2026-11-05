@@ -25,6 +25,15 @@ from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+# Windows CI（GitHub Actions runner）的 stdout 是 cp1252，中文用例名会在
+# print 时抛 UnicodeEncodeError 把测试判成失败 —— 这不是测试逻辑问题，
+# 但会让 CI 永远红。统一把 stdout 改成 UTF-8，且 modify 失败时退回
+# backslashreplace（宁可显示成 \uXXXX，也不要因为编码炸掉）。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="backslashreplace")
+except Exception:  # noqa: BLE001 - 老版本 / 非标准流
+    pass
+
 _PASS = []
 _FAIL = []
 
@@ -317,14 +326,22 @@ def _():
 
 
 # --------------------------------------------------------------------------
+def _say(text):
+    """打印一行。编码不支持时退化成 ASCII 安全形式，绝不让编码问题影响判定。"""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", "backslashreplace").decode("ascii"))
+
+
 def main():
     total = len(_PASS) + len(_FAIL)
     for item in _PASS:
-        print("PASS %s" % item)
+        _say("PASS %s" % item)
     for name, tb in _FAIL:
-        print("FAIL %s" % name)
-        print(tb)
-    print("== %d/%d passed ==" % (len(_PASS), total))
+        _say("FAIL %s" % name)
+        _say(tb)
+    _say("== %d/%d passed ==" % (len(_PASS), total))
     return 0 if not _FAIL else 1
 
 
