@@ -260,6 +260,18 @@ app.include_router(growth_center.router)
 app.include_router(ip_management.router)
 from admin.routers import client_profile
 app.include_router(client_profile.router)
+# 客户端路径手动指定（`install_paths` 的后台覆盖入口）。
+#
+# 自动发现按「固定目录名 + 动态盘符/父文件夹」定位，绝大多数机器直接能找到；
+# 但绿色版解压到极深目录、把 userData 迁到网络盘、或系统环境变量被改过时，
+# 仍需要用户手工指定一次。**没有这条路由，`install_paths.save()` 就没有
+# 任何调用方** —— 保存能力等于不存在。
+#
+# 安全：`env_guard.PROD_BLOCKED_PREFIXES` 已把 `/api/client-paths` 列为
+# 生产高危前缀（它能覆盖客户端安装目录 / 读本机磁盘），prod 下由中间件
+# 统一打成 404，与 `/api/app-source`、`/api/client-profile` 同等待遇。
+from admin.routers import client_paths
+app.include_router(client_paths.router)
 # 多平台：平台元信息（控制台切换模块的唯一数据源）+ Trae 专属管理接口。
 from admin.platform.router import router as platforms_router
 app.include_router(platforms_router)

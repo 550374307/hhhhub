@@ -145,7 +145,19 @@ def saved_overrides() -> dict:
     return data
 
 
-def _write_saved(data: dict) -> None:
+def _write_saved(data: dict) -> bool:
+    """把覆盖写回 `system_settings`。**返回是否写成功**。
+
+    与 `_db_load()` 的口径保持一致：数据库不可用时**降级而不是抛异常**。
+
+    原来这里 `raise`，于是 `save()` / `clear()` 在数据库短暂不可用时会直接
+    500 —— 而这对「改一个路径」这类操作毫无意义：用户在控制台点保存，
+    看到的是「服务器错误」，既不知道有没有保存成功，也重试不了。
+    改成返回 False，由调用方如实回报「没写进库」，前端可以提示重试。
+
+    注意：写失败时**不更新**进程内缓存，否则会出现「界面显示已保存、
+    重启后路径又回去了」这种更难查的假象。
+    """
     try:
         from admin.db import SessionLocal
         from admin.models import SystemSetting
@@ -162,19 +174,24 @@ def _write_saved(data: dict) -> None:
             db.commit()
         finally:
             db.close()
-    except Exception as exc:  # noqa: BLE001
-        _logger.warning("保存客户端路径覆盖失败：%s", exc)
-        raise
+    except Exception as exc:  # noqa: BLE001 - 库不可用不该打死改路径
+        _logger.warning("保存客户端路径覆盖失败（未写入库）：%s", exc)
+        return False
     with _lock:
         global _saved_at
         _saved_cache.clear()
         _saved_cache.update(data)
         _saved_at = time.time()
-        _scan_cache.clear()
+    _scan_cache.clear()
+    return True
 
 
 def save(platform: str, values: dict) -> dict:
-    """保存某平台的覆盖（merge 语义，空串 = 清除该项），立即生效。"""
+    """保存某平台的覆盖（merge 语义，空串 = 清除该项），立即生效。
+
+    返回该平台**当前生效**的覆盖。写库失败时额外带
+    `persisted=False`，让调用方能区分「存成功」和「只在内存里」。
+    """
     pid = str(platform or "").strip().lower()
     data = _saved()
     cur = dict(data.get(pid) or {})
@@ -189,8 +206,12 @@ def save(platform: str, values: dict) -> dict:
         data[pid] = cur
     else:
         data.pop(pid, None)
-    _write_saved(data)
-    return cur
+    persisted = _write_saved(data)
+    out = dict(cur)
+    out["persisted"] = persisted
+    if not persisted:
+        out["warning"] = "数据库不可用，覆盖未持久化（重启后会丢失）"
+    return out
 
 
 def clear(platform: str) -> dict:
@@ -198,8 +219,8 @@ def clear(platform: str) -> dict:
     pid = str(platform or "").strip().lower()
     data = _saved()
     data.pop(pid, None)
-    _write_saved(data)
-    return {}
+    persisted = _write_saved(data)
+    return {"persisted": persisted}
 
 
 def override(platform: str, key: str) -> tuple[str, str]:

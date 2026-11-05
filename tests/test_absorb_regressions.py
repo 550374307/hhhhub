@@ -524,6 +524,35 @@ def _():
     assert second is False, "限频内必须拒绝"
 
 
+@check("paths: install_paths.save 在库不可用时降级而非抛 500")
+def _():
+    """数据库不可用是一种正常运行状态（首次启动、库重启），
+    改一个路径不该因此变成「服务器错误」。"""
+    from admin.platform import install_paths as ip
+
+    r = ip.save("codearts", {"install_dir": r"C:\test\codearts"})
+    assert isinstance(r, dict), r
+    assert "install_dir" in r, r
+    # 本测试环境通常没有真实 MySQL，所以 persisted 应为 False 且带 warning；
+    # 若真连上了库，persisted=True 也算通过 —— 两种都必须是「不抛异常」。
+    assert "persisted" in r, r
+    if not r["persisted"]:
+        assert r.get("warning"), "未持久化时必须给用户可见的提示"
+    c = ip.clear("codearts")
+    assert isinstance(c, dict) and "persisted" in c, c
+
+
+@check("client_paths: 路由覆盖全部平台（含 codearts / raccoon）")
+def _():
+    from admin.routers import client_paths as cp
+
+    r = cp.list_all(_admin=True)
+    plats = r.get("platforms") or []
+    assert "codearts" in plats, plats
+    assert "raccoon" in plats, plats
+    assert (r.get("keys") or []), r
+
+
 # --------------------------------------------------------------------------
 def _say(text):
     """打印一行。编码不支持时退化成 ASCII 安全形式，绝不让编码问题影响判定。"""
