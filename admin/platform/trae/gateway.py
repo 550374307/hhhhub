@@ -432,7 +432,114 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
     started = time.perf_counter()
 
     msg_id = "msg_solo_" + str(int(time.time() * 1000))
-    anthropic_started = {"done": False}
+    #: Anthropic/Responses 流式状态：
+    #:   done      已经发过 message_start / response.created
+    #:   text_open 当前是否有打开的 text 内容块
+    #:   next_index 下一个可用的 content_block index
+    #:   tools      已打开的工具块 {tool_calls[].index: content_block index}
+    #:
+    #: SOLO 的 `tool_calls` 与正文是**混在同一路事件流**里来的，必须能随时
+    #: 关掉 text 块再开工具块（Anthropic 不允许两个块同时打开）。
+    anthropic_started = {"done": False, "text_open": False,
+                         "next_index": 0, "tools": {}}
+
+    def _ensure_anthropic_started():
+        """惰性发 message_start + 首个 text 块。"""
+        frames = []
+        if not anthropic_started["done"]:
+            anthropic_started["done"] = True
+            frames.append({"type": "message_start",
+                           "message": {"id": msg_id, "type": "message",
+                                       "role": "assistant", "model": model,
+                                       "content": [], "stop_reason": None,
+                                       "usage": {"input_tokens": 0,
+                                                 "output_tokens": 0}}})
+        return frames
+
+    def _close_text_block():
+        """关掉正在打开的 text 块并返回帧（未打开则返回空）。"""
+        if not anthropic_started["text_open"]:
+            return []
+        anthropic_started["text_open"] = False
+        idx = anthropic_started.get("text_index", 0)
+        return [{"type": "content_block_stop", "index": idx}]
+
+    def _solo_anthropic_tool_frames(converted, msg_id_, model_, _state):
+        """SOLO 工具调用 → Anthropic `tool_use` 内容块帧。
+
+        每个 `tool_calls[].index` 对应一个独立的 content_block；开新工具块
+        之前必须先关掉 text 块与已开的工具块（Anthropic 同一时刻只允许
+        一个块是打开状态）。
+        """
+        frames = _ensure_anthropic_started()
+        frames.extend(_close_text_block())
+        for piece in converted:
+            slot = piece.get("index")
+            if not isinstance(slot, int):
+                slot = 0
+            args = piece.get("function", {}).get("arguments") or ""
+            if slot not in anthropic_started["tools"]:
+                # 上一个工具块的参数已经给全了，关掉再开新的
+                if anthropic_started["tools"]:
+                    for _open in list(anthropic_started["tools"].values()):
+                        frames.append({"type": "content_block_stop",
+                                       "index": _open})
+                    anthropic_started["tools"] = {}
+                idx = anthropic_started["next_index"]
+                anthropic_started["next_index"] += 1
+                anthropic_started["tools"][slot] = idx
+                frames.append({
+                    "type": "content_block_start", "index": idx,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": str(piece.get("id") or ("call_%d" % slot)),
+                        "name": str((piece.get("function") or {}).get("name")
+                                    or "unknown"),
+                        "input": {}}})
+            idx = anthropic_started["tools"][slot]
+            if args:
+                frames.append({"type": "content_block_delta", "index": idx,
+                               "delta": {"type": "input_json_delta",
+                                         "partial_json": args}})
+        return "".join("data: %s\n\n" % _json.dumps(f, ensure_ascii=False)
+                       for f in frames)
+
+    def _solo_responses_tool_frames(converted, msg_id_, model_, _state):
+        """SOLO 工具调用 → Responses `function_call` 输出项。
+
+        Responses 协议里工具调用是**独立的 output item**，不是正文的一
+        部分，所以要 output_item.added / arguments.delta / output_item.done。
+        """
+        frames = []
+        if not anthropic_started["done"]:
+            anthropic_started["done"] = True
+            frames.append({"type": "response.created",
+                           "response": {"id": msg_id_, "object": "response",
+                                        "status": "in_progress",
+                                        "model": model_, "output": []}})
+        for piece in converted:
+            slot = piece.get("index")
+            if not isinstance(slot, int):
+                slot = 0
+            item_id = "fc_%s_%d" % (msg_id_, slot)
+            name = str((piece.get("function") or {}).get("name") or "unknown")
+            args = (piece.get("function") or {}).get("arguments") or ""
+            frames.append({"type": "response.output_item.added",
+                           "output_index": slot,
+                           "item": {"type": "function_call", "id": item_id,
+                                    "call_id": str(piece.get("id") or item_id),
+                                    "name": name, "arguments": ""}})
+            if args:
+                frames.append({"type": "response.function_call_arguments.delta",
+                               "item_id": item_id, "output_index": slot,
+                               "delta": args})
+            frames.append({"type": "response.output_item.done",
+                           "output_index": slot,
+                           "item": {"type": "function_call", "id": item_id,
+                                    "call_id": str(piece.get("id") or item_id),
+                                    "name": name, "arguments": args}})
+        return "".join("data: %s\n\n" % _json.dumps(f, ensure_ascii=False)
+                       for f in frames)
 
     def render_event(event) -> str:
         """把 SOLO 事件翻成**目标协议**的 SSE 帧。
@@ -477,29 +584,41 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
                                           "delta": {"tool_calls": converted},
                                           "finish_reason": None}]}
                     return "data: %s\n\n" % _json.dumps(chunk, ensure_ascii=False)
-                # anthropic / responses 协议：把工具调用拼成 JSON 文本块发下去，
-                # 由客户端自己解析（这两条协议的 tool_use 形状与 OpenAI 差异太大）
-                text = _json.dumps({"tool_calls": converted}, ensure_ascii=False)
+                # anthropic / responses 协议：**按各自协议发真正的工具帧**。
+                #
+                # 旧实现是 `text = _json.dumps({"tool_calls": converted})` ——
+                # 把工具调用拼成一段 JSON **文本**当正文发下去，指望「客户端自己
+                # 解析」。实际结果是客户端把它渲染成一段普通气泡，既不执行工具
+                # 也不报错，agent 任务在这里静默死掉。
+                #
+                # 这两条协议的工具调用形状与 OpenAI 确实不同，但差异是**可映射**的：
+                #   · Anthropic：tool_use 内容块（start -> input_json_delta -> stop）
+                #   · Responses：function_call 输出项
+                # 已开着的 text 块要由下面的构建函数先关掉。
+                if target == "messages":
+                    return _solo_anthropic_tool_frames(
+                        converted, msg_id, model, anthropic_started)
+                return _solo_responses_tool_frames(
+                    converted, msg_id, model, anthropic_started)
 
         if not reasoning and not text:
             return ""
 
         # ---- Anthropic `messages` ----
         if target == "messages":
-            frames = []
-            if not anthropic_started["done"]:
-                anthropic_started["done"] = True
-                frames.append({
-                    "type": "message_start",
-                    "message": {"id": msg_id, "type": "message",
-                                "role": "assistant", "model": model,
-                                "content": [], "stop_reason": None,
-                                "usage": {"input_tokens": 0, "output_tokens": 0}},
-                })
-                frames.append({"type": "content_block_start", "index": 0,
+            frames = _ensure_anthropic_started()
+            # 文本块惰性打开：工具调用回合不该先冒一个空 text 块；而且工具
+            # 块开过之后必须换新 index，不能复用 0（那会覆盖工具块）。
+            if not anthropic_started.get("text_open"):
+                idx = anthropic_started["next_index"]
+                anthropic_started["next_index"] += 1
+                anthropic_started["text_index"] = idx
+                anthropic_started["text_open"] = True
+                frames.append({"type": "content_block_start", "index": idx,
                                "content_block": {"type": "text", "text": ""}})
+            idx = anthropic_started.get("text_index", 0)
             piece = text or reasoning
-            frames.append({"type": "content_block_delta", "index": 0,
+            frames.append({"type": "content_block_delta", "index": idx,
                            "delta": {"type": "text_delta", "text": piece}})
             return "".join("data: %s\n\n" % _json.dumps(f, ensure_ascii=False)
                            for f in frames)
@@ -665,9 +784,17 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
                 except Exception:  # noqa: BLE001
                     credit = 0.0
                 if target == "messages":
-                    yield "data: %s\n\n" % _json.dumps(
-                        {"type": "content_block_stop", "index": 0},
-                        ensure_ascii=False)
+                    # 关掉所有还开着的块（文本块 + 各工具块）。
+                    # 旧实现硬编码 `content_block_stop index=0`：工具块开在
+                    # 别的 index 上，客户端就会一直等一个永远不来的 stop。
+                    for _stop in _close_text_block():
+                        yield "data: %s\n\n" % _json.dumps(_stop,
+                                                           ensure_ascii=False)
+                    for _open in list(anthropic_started["tools"].values()):
+                        yield "data: %s\n\n" % _json.dumps(
+                            {"type": "content_block_stop", "index": _open},
+                            ensure_ascii=False)
+                    anthropic_started["tools"] = {}
                     # Anthropic 的 usage 要把缓存命中单列（cache_read_input_tokens），
                     # 漏了它客户端的命中率恒为 0，而平台侧账目是对的。
                     _a_u = None
@@ -687,9 +814,16 @@ async def _solo_chat(request, db, key, payload, realm, model, messages,
                     if credit:
                         _a_u.update({"credit": credit, "credits": credit,
                                      "cost": credit})
+                    # OpenAI 的 `tool_calls` 在 Anthropic 里叫 `tool_use`。
+                    # 直接把 finish 值塞进 stop_reason 会得到 "tool_calls" ——
+                    # 客户端不认识这个取值，按「回合正常结束」处理，于是
+                    # 拿到一堆 tool_use 块却不去执行。
+                    _stop_reason = {"stop": "end_turn", "length": "max_tokens",
+                                    "tool_calls": "tool_use"}.get(
+                                        str(finish or ""), finish or "end_turn")
                     yield "data: %s\n\n" % _json.dumps(
                         {"type": "message_delta",
-                         "delta": {"stop_reason": finish or "end_turn"},
+                         "delta": {"stop_reason": _stop_reason},
                          "usage": _a_u},
                         ensure_ascii=False)
                     yield "data: %s\n\n" % _json.dumps(
