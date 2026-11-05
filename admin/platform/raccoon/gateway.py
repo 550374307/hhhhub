@@ -1026,88 +1026,21 @@ async def messages(request):
 
 
 async def _forward_stream_anthropic(body: dict, request, model: str):
-    """上游 OpenAI 流 → Anthropic 事件流。"""
+    """上游 OpenAI 流 → Anthropic 事件流。
+
+    委托给 `protocol_bridge.anthropic_stream_relay`。
+
+    本地旧实现只翻 text/thinking：`delta["tool_calls"]` 被静默丢弃，
+    `stop_reason` 恒 `"end_turn"` —— 客户端据此认为「助手结束了回合但
+    没有调用工具」，agent 任务在第一次工具调用处终止。
+    请求方向（`_anthropic_to_openai`）本来就是完整的，缺的只有这一层。
+    """
+    from admin.platform import protocol_bridge
+
     inner = await _forward_stream(body, request)
     if getattr(inner, "status_code", 200) >= 400:
         return inner
-
-    async def relay():
-        msg_id = "msg_raccoon_" + str(int(time.time() * 1000))
-        started = False
-        finished = False
-        usage_seen: dict = {}
-
-        def close_events():
-            """content_block_stop + message_delta + message_stop 三帧收尾。"""
-            return [
-                ("data: %s\n\n" % json.dumps(
-                    {"type": "content_block_stop", "index": 0},
-                    ensure_ascii=False)).encode(),
-                ("data: %s\n\n" % json.dumps(
-                    {"type": "message_delta",
-                     "delta": {"stop_reason": "end_turn"},
-                     "usage": _anthropic_usage_of(usage_seen)},
-                    ensure_ascii=False)).encode(),
-                ("data: %s\n\n" % json.dumps(
-                    {"type": "message_stop"}, ensure_ascii=False)).encode(),
-            ]
-
-        async for frame in inner.body_iterator:
-            text = frame.decode("utf-8", "replace") if isinstance(frame, bytes) else str(frame)
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload in ("", "[DONE]"):
-                    continue
-                try:
-                    chunk = json.loads(payload)
-                except ValueError:
-                    continue
-                if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
-                    usage_seen = chunk["usage"]
-                choice = (chunk.get("choices") or [{}])[0]
-                delta = choice.get("delta") or {}
-                piece = delta.get("content") or delta.get("reasoning_content") or ""
-                if not piece:
-                    if choice.get("finish_reason") and started and not finished:
-                        finished = True
-                        for ev in close_events():
-                            yield ev
-                    continue
-                if not started:
-                    started = True
-                    yield ("data: %s\n\n" % json.dumps(
-                        {"type": "message_start",
-                         "message": {"id": msg_id, "type": "message",
-                                     "role": "assistant", "model": model,
-                                     "content": [], "stop_reason": None,
-                                     "usage": {"input_tokens": 0, "output_tokens": 0}}},
-                        ensure_ascii=False)).encode()
-                    yield ("data: %s\n\n" % json.dumps(
-                        {"type": "content_block_start", "index": 0,
-                         "content_block": {"type": "text", "text": ""}},
-                        ensure_ascii=False)).encode()
-                yield ("data: %s\n\n" % json.dumps(
-                    {"type": "content_block_delta", "index": 0,
-                     "delta": {"type": "text_delta", "text": piece}},
-                    ensure_ascii=False)).encode()
-
-        # ⚠️ 收尾不能只挂在 `finish_reason` 上。
-        #
-        # 实测（2026-11-03）：上游某些模型/截断场景**不发 finish_reason**
-        # 就结束流。旧写法把三帧收尾全塞在 finish_reason 分支里，于是
-        # 客户端只收到 message_start + 若干 delta、**永远等不到 message_stop**，
-        # 表现为「回答完了但界面一直转圈」，只能超时。
-        # 这里保证：只要开过头，流结束时一定补齐收尾。
-        if started and not finished:
-            for ev in close_events():
-                yield ev
-
-    return StreamingResponse(
-        relay(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return protocol_bridge.anthropic_stream_relay(inner, model, prefix="msg_raccoon")
 
 
 async def count_tokens(request):
