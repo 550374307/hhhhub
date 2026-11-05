@@ -1141,6 +1141,39 @@ class PlatformDispatchMiddleware:
 
         _set_state(scope, platform_id, realm)
 
+        # ---- 2.5) 模型名对到**目标平台自己的**真实 id ----
+        #
+        # 同一个模型在不同平台的写法不同：
+        #     GLM-5.3-Flash   WorkBuddy: glm-5.3-flash | Loomy: GLM-5.3-Flash
+        # `/v1/models` 为了跨平台一致，对外统一发小写 slug（可加平台后缀）。
+        # 上游只认自己的写法，直接把 slug 转过去就是「模型不存在」400；
+        # 而全局的 `upstream_of()` 在**同名冲突**时可能返回别家的拼法。
+        #
+        # 所以平台定下来之后，按 (platform, model) 收窄还原一次。
+        # 注意：必须在 `platform_id` 最终确定之后做 —— 上面的 slug 还原
+        # 发生在平台未定阶段，那时只能全局扫，正是这条 400 的成因。
+        if body:
+            try:
+                from admin.platform import models_router as _mr
+
+                _spec_mp = registry.get(platform_id)
+                _storage_mp = (str(_spec_mp.storage()).lower()
+                               if _spec_mp is not None else "")
+                _cur_mp = _model_of_body(body)
+                if _cur_mp and _storage_mp:
+                    with _db() as _rdb:
+                        _real_mp = _mr.upstream_of_in_platform(
+                            _cur_mp, _storage_mp, _rdb)
+                    if _real_mp and _real_mp != _cur_mp:
+                        body = _replace_model(body, _real_mp)
+                        receive = _replay_receive(body, tail)
+                        request = Request(scope, receive)
+                        logger.debug("模型名按平台还原 | %s -> %s (%s)",
+                                     _cur_mp, _real_mp, _storage_mp)
+            except Exception:  # noqa: BLE001 - 还原失败就按原样转发
+                logger.debug("平台内模型还原失败 model=%s",
+                             _model_of_body(body), exc_info=True)
+
         # **带平台后缀的请求永远走平台网关**，哪怕它指向默认平台。
         # 理由：后缀是的「我要这个平台的实现」，交给主应用等于
         # 用错实现（主应用没有平台侧的账号池 / 倍率 / 风控）。

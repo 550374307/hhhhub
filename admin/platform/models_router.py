@@ -709,6 +709,72 @@ def upstream_of(slug: str, db=None) -> str:
                 pass
 
 
+def upstream_of_in_platform(slug: str, storage: str, db=None) -> str:
+    """把「某个平台的名字」还原成**该平台自己的真实 model_id**。
+
+    与 `upstream_of()` 的区别（这就是「同名冲突」的修法）：
+
+        glm-5.3-flash   在 WorkBuddy 叫 `glm-5.3-flash`
+                        在 Loomy 叫 `GLM-5.3-Flash`
+                        在 Trae  叫 `glm-5.3-flash`
+
+    `/v1/models` 为了跨平台一致，对外统一发小写 slug + 平台后缀
+    （`glm-5.3-flash-loomy`）。但上游只认自己的写法 —— 把 slug 原样
+    发给 Loomy 就是「模型不存在」。而 `upstream_of()` 是**全局**扫描、
+    不区分平台，同名时可能返回别家的拼法，同样会 400。
+
+    所以：平台确定之后，必须按 `(platform, model)` 收窄再还原。
+    找不到就返回空串（让上层决定原样透传，别悄悄换成别的模型）。
+    """
+    target = str(slug or "").strip().lower()
+    store = str(storage or "").strip().lower()
+    if not target or not store:
+        return ""
+    own_db = db is None
+    try:
+        if own_db:
+            from admin.db import SessionLocal
+
+            db = SessionLocal()
+        from sqlalchemy import func as _sql_func
+
+        from admin.models import ModelConfig
+
+        rows = (db.query(ModelConfig)
+                .filter(ModelConfig.enabled == 1,
+                        _sql_func.lower(ModelConfig.platform) == store)
+                .all())
+        # 1) 完全同名（大小写不敏感）—— 最常见，直接命中
+        for row in rows:
+            raw = str(row.model_id or "")
+            if raw and raw.lower() == target:
+                return raw
+        # 2) slug 归一后相同（`GLM-5.3-Flash` <-> `glm53flash`）
+        target_slug = slugify_model_id(target)
+        for row in rows:
+            raw = str(row.model_id or "")
+            if not raw:
+                continue
+            if slugify_model_id(raw) == target:
+                return raw
+            if target_slug and slugify_model_id(raw) == target_slug:
+                return raw
+            # 3) 缩写映射后的名字（`deepseek-flash` -> `dfmodel`）
+            readable = readable_model_id(store, raw)
+            if slugify_model_id(readable) == target:
+                return raw
+        return ""
+    except Exception:  # noqa: BLE001
+        logger.debug("平台内模型还原失败 storage=%s slug=%s", store, slug, exc_info=True)
+        return ""
+    finally:
+        if own_db and db is not None:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def to_openai_strict(payload: dict, readable: bool = True) -> dict:
     """裁成**最严格**的 OpenAI `/v1/models` 形状。
 
