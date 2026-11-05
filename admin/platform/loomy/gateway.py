@@ -103,7 +103,13 @@ def _fail(exc: client.UpstreamError) -> JSONResponse:
 
 
 #: 上游只认这三个角色。别的角色进来后**不能原样透传**。
-_UPSTREAM_ROLES = frozenset({"system", "user", "assistant"})
+#: 上游（OpenAI 兼容 /chat/completions）接受的角色。
+#:
+#: 2026-11-05 修正：官方客户端打同一上游端点的 498 条真实请求体里，
+#: `tool` 消息（175 条）与 assistant `tool_calls`（122 条）**原样透传，
+#: 490/490 全部 200** —— 之前「上游只认三种角色」的判断是错的，
+#: 把 tool 转成 user 文本反而导致工具调用不生效。
+_UPSTREAM_ROLES = frozenset({"system", "user", "assistant", "tool"})
 
 
 def normalize_messages(raw) -> list[dict]:
@@ -111,20 +117,22 @@ def normalize_messages(raw) -> list[dict]:
 
     ## 为什么必须做
 
-    上游（Loomy）只认 `system` / `user` / `assistant` 三种角色。
     `developer` 是 OpenAI 较新的角色，DSH 这类 harness 在**开推理时**
-    会用它承载系统提示（还把整段 system prompt 塞进去）。
+    会用它承载系统提示（还把整段 system prompt 塞进去），上游不认，
+    需要归一成 `system`。
 
-    原样透传的后果**不是报错，而是流式永久卡死**：
-    上游静默丢弃这条消息、仍然回 200、但从不发 `finish_reason`，
-    客户端就一直等。
-
-    ## 归一规则
+    ## 归一规则（改为**结构化透传**）
 
     * `developer` -> `system`（它本来就是系统提示的语义）
-    * `tool` / `function` -> `user`（老式函数结果，上游无对应角色）
+    * `tool` -> **原样保留**（含 `tool_call_id` / `name`），上游实测接受；
+      老式 `function` 角色没有 call id 结构，归一到 `tool` 并保留凭据
+    * assistant 的 `tool_calls` -> **原样保留**（不再压成 JSON 文本块）。
+      之前转文本的后果：模型把上一轮调用读成「一段描述」，
+      参数经常缺引号/少括号，客户端解析失败直接中断
     * 未知角色 -> 丢弃
     * `system` **全部前置**（中途出现的 system 会失去指令权重）
+    * content 数组仍取文本块（上游文本协议）；assistant 工具调用消息的
+      `content: null` 保留 —— 那是标准 OpenAI 形状
     """
     if not isinstance(raw, list):
         return []
@@ -134,25 +142,16 @@ def normalize_messages(raw) -> list[dict]:
         if not isinstance(item, dict):
             continue
         role = str(item.get("role") or "").strip().lower()
-        # 工具结果要**带上调用标识**再转 user：
-        # 只写 content 的话模型看到的是一段孤立文本，不知道它对应哪次调用，
-        # 于是会重复调同一个工具（或干脆不调）。这里包一层可读标记。
-        tool_hint = ""
         if role == "developer":
             role = "system"
-        elif role in ("tool", "function"):
-            role = "user"
-            _tcid = str(item.get("tool_call_id") or item.get("name") or "").strip()
-            _raw_c = item.get("content")
-            _txt = _raw_c if isinstance(_raw_c, str) else ""
-            if not _txt and isinstance(_raw_c, list):
-                _txt = "".join(str(b.get("text") or "") for b in _raw_c
-                               if isinstance(b, dict))
-            tool_hint = ("[tool result%s]\n%s"
-                         % (" for " + _tcid if _tcid else "", _txt))
+        elif role == "function":
+            # 老式 function 角色语义等同工具结果。上游实测接受 role=tool，
+            # 所以归一到 tool 并保留调用标识，不再降级成 user 文本
+            # （降级会让模型把结果当成又一条用户消息，重复发起同一调用）。
+            role = "tool"
         if role not in _UPSTREAM_ROLES:
             continue
-        content = tool_hint or item.get("content")
+        content = item.get("content")
         if isinstance(content, list):
             # 兼容 parts 数组：只取文本块
             parts = []
@@ -162,42 +161,45 @@ def normalize_messages(raw) -> list[dict]:
                 elif isinstance(block, str):
                     parts.append(block)
             content = "".join(parts)
-        if content is None:
+        # content=None 只允许标准 OpenAI 形状
+        # `{"role":"assistant","content":null,"tool_calls":[...]}`；
+        # 其余空消息直接丢，避免上游把空输入当非法请求。
+        _has_calls = isinstance(item.get("tool_calls"), list)
+        if content is None and not (role == "assistant" and _has_calls):
             continue
-        # assistant 发起的工具调用：上游只认纯文本消息，但我们**不能把结构化
-        # 调用压成一句 `name(args); name(args)`** —— 那样模型在下一轮看到的
-        # 是「一段描述」而不是「一次真实调用」，于是它要么重复调同一个工具，
-        # 要么把参数写成散文（实测：跑任务时参数经常缺引号/少括号，客户端
-        # 解析失败直接中断）。
-        #
-        # 改成严格的 JSON 代码块 + 一行说明：模型能明确看出「我上一轮调了
-        # 什么、参数是什么」，工具名与参数都保持原样转义，不会串行化丢失。
-        if role == "assistant" and isinstance(item.get("tool_calls"), list):
-            _calls = []
-            for _c in item["tool_calls"]:
-                if not isinstance(_c, dict):
+        message = {"role": role, "content": content}
+        if role == "tool":
+            # 工具结果**原样透传**（含调用标识）：丢掉 tool_call_id 的话
+            # 模型不知道结果对应哪次调用，会重复调用。
+            _tcid = item.get("tool_call_id")
+            if _tcid:
+                message["tool_call_id"] = str(_tcid)
+            elif item.get("name"):
+                # function 角色没有 tool_call_id，用 name 兜住配对凭据
+                message["tool_call_id"] = str(item["name"])
+            if item.get("name"):
+                message["name"] = str(item["name"])
+        if role == "assistant" and _has_calls:
+            # assistant 的工具调用**原样保留**（不再压成 JSON 文本块）：
+            # 转文本会让模型把调用读成「一段描述」，参数经常缺引号/少括号。
+            # 唯一例外：协议要求 arguments 是字符串；客户端传对象时序列化回去。
+            calls = []
+            for call in item["tool_calls"]:
+                if not isinstance(call, dict):
                     continue
-                _fn = _c.get("function") if isinstance(_c.get("function"), dict) else {}
-                _args = _fn.get("arguments")
-                if isinstance(_args, str):
-                    try:
-                        _args = json.loads(_args)
-                    except Exception:  # noqa: BLE001 - 保留原串，别丢信息
-                        pass
-                _calls.append({"name": _fn.get("name") or "unknown",
-                               "arguments": _args if _args is not None else {}})
-            if _calls:
-                _prev = content if isinstance(content, str) else ""
-                _block = json.dumps(_calls, ensure_ascii=False)
-                content = ("%s\n\n[上一轮你调用过的工具]\n```json\n%s\n```\n"
-                           "这些调用已经执行完毕，结果在下面以 [tool result] 开头给出。"
-                           % (_prev, _block)).strip()
+                c = dict(call)
+                fn = c.get("function")
+                if isinstance(fn, dict) and not isinstance(fn.get("arguments"), str):
+                    fn = dict(fn)
+                    fn["arguments"] = json.dumps(fn.get("arguments"), ensure_ascii=False)
+                    c["function"] = fn
+                calls.append(c)
+            message["tool_calls"] = calls
         if role == "system":
-            systems.append({"role": "system", "content": content})
+            systems.append(message)
         else:
-            others.append({"role": role, "content": content})
+            others.append(message)
     return systems + others
-
 
 def _apply_no_think(body: dict) -> dict:
     """关掉推理链的三层保险（对非 reasoning 模型是 noop）。
@@ -821,42 +823,20 @@ def _sse_from_chat(result: dict):
 
 
 def _anthropic_to_openai(body: dict) -> dict:
-    """Anthropic 请求体 → OpenAI 请求体。"""
-    messages = []
-    system = body.get("system")
-    if isinstance(system, str) and system.strip():
-        messages.append({"role": "system", "content": system})
-    elif isinstance(system, list):
-        text = "".join(str(b.get("text") or "") for b in system
-                       if isinstance(b, dict))
-        if text.strip():
-            messages.append({"role": "system", "content": text})
+    """Anthropic 请求体 → OpenAI 请求体。
 
-    for item in body.get("messages") or []:
-        if not isinstance(item, dict):
-            continue
-        role = str(item.get("role") or "").strip().lower()
-        content = item.get("content")
-        if isinstance(content, list):
-            parts = []
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "text":
-                    parts.append(str(block.get("text") or ""))
-                elif isinstance(block, str):
-                    parts.append(block)
-            content = "".join(parts)
-        # 角色归一统一在 `normalize_messages`（`_apply_no_think` 里调用），
-        # 这里只把 Anthropic 的结构拆成 OpenAI 的样子。
-        if role and content is not None:
-            messages.append({"role": role, "content": content})
+    委托给 `protocol_bridge.anthropic_to_openai`。
 
-    out = {"model": body.get("model"),
-           "messages": messages,
-           "max_tokens": body.get("max_tokens") or 4096}
-    for key in ("temperature", "top_p", "stream"):
-        if key in body:
-            out[key] = body[key]
-    return out
+    本地旧实现只挑 `type == "text"` 的 content 块，**完全丢掉**
+    `tools` / `tool_use` / `tool_result` —— 于是 Claude Code 系客户端在
+    执行工具的那一轮发上来的工具结果变成空正文，任务直接卡死。
+    桥的实现覆盖：tools 定义、assistant 的 tool_use → tool_calls、
+    user 的 tool_result → role="tool"、图片块、tool_choice。
+    """
+    from admin.platform import protocol_bridge
+
+    out = protocol_bridge.anthropic_to_openai(body)
+    return _apply_no_think(out)
 
 
 def _anthropic_usage_of(usage) -> dict:
@@ -920,69 +900,25 @@ async def messages(request):
 
 
 async def _forward_stream_anthropic(body: dict, request, model: str):
-    """把 Loomy 的上游流翻成 Anthropic `content_block_delta` 事件流。"""
+    """把上游 OpenAI chunk 流翻成 Anthropic 事件流。
+
+    委托给 `protocol_bridge.anthropic_stream_relay`。
+
+    本地旧实现的两个致命遗漏（都会让 agent 型客户端在工具那一步停住）：
+      * `piece = delta.get("content") or delta.get("reasoning_content") or ""`
+        —— **从不读 `delta["tool_calls"]`**，工具调用被静默丢弃；
+      * `stop_reason` 硬编码 `"end_turn"`，客户端据此判断「助手结束了回合
+        但没有调用工具」，任务直接终止。
+    桥的实现输出正确的 `tool_use` 内容块
+    （content_block_start -> input_json_delta -> content_block_stop）并把
+    stop_reason 映射成 `tool_use`，另外补了思考块、空闲心跳与错误帧。
+    """
+    from admin.platform import protocol_bridge
+
     inner = await _forward_stream(body, request)
     if getattr(inner, "status_code", 200) >= 400:
         return inner
-
-    async def relay():
-        msg_id = "msg_loomy_" + str(int(time.time() * 1000))
-        started = False
-        usage_seen: dict = {}
-        async for frame in inner.body_iterator:
-            text = frame.decode("utf-8", "replace") if isinstance(frame, bytes) else str(frame)
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload in ("", "[DONE]"):
-                    continue
-                try:
-                    chunk = json.loads(payload)
-                except ValueError:
-                    continue
-                if isinstance(chunk.get("usage"), dict) and chunk["usage"]:
-                    usage_seen = chunk["usage"]
-                choice = (chunk.get("choices") or [{}])[0]
-                delta = choice.get("delta") or {}
-                piece = delta.get("content") or delta.get("reasoning_content") or ""
-                if not piece:
-                    if choice.get("finish_reason") and started:
-                        yield ("data: %s\n\n" % json.dumps(
-                            {"type": "content_block_stop", "index": 0},
-                            ensure_ascii=False)).encode()
-                        yield ("data: %s\n\n" % json.dumps(
-                            {"type": "message_delta",
-                             "delta": {"stop_reason": "end_turn"},
-                             "usage": _anthropic_usage_of(usage_seen)},
-                            ensure_ascii=False)).encode()
-                        yield ("data: %s\n\n" % json.dumps(
-                            {"type": "message_stop"},
-                            ensure_ascii=False)).encode()
-                    continue
-                if not started:
-                    started = True
-                    yield ("data: %s\n\n" % json.dumps(
-                        {"type": "message_start",
-                         "message": {"id": msg_id, "type": "message",
-                                     "role": "assistant", "model": model,
-                                     "content": [], "stop_reason": None,
-                                     "usage": {"input_tokens": 0,
-                                               "output_tokens": 0}}},
-                        ensure_ascii=False)).encode()
-                    yield ("data: %s\n\n" % json.dumps(
-                        {"type": "content_block_start", "index": 0,
-                         "content_block": {"type": "text", "text": ""}},
-                        ensure_ascii=False)).encode()
-                yield ("data: %s\n\n" % json.dumps(
-                    {"type": "content_block_delta", "index": 0,
-                     "delta": {"type": "text_delta", "text": piece}},
-                    ensure_ascii=False)).encode()
-
-    return StreamingResponse(
-        relay(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return protocol_bridge.anthropic_stream_relay(inner, model, prefix="msg_loomy")
 
 
 async def count_tokens(request):
