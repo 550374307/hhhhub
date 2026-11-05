@@ -459,11 +459,20 @@ async def messages(request):
 
     body = await _body_of(request)
     realm = _realm(request)
-    normalized = dict(body)
-    system = body.get("system")
-    if system:
-        prefix = [{"role": "system", "content": system}]
-        normalized["messages"] = prefix + list(body.get("messages") or [])
+    # **Anthropic → OpenAI 必须走协议桥**。
+    #
+    # 旧实现是 `normalized = dict(body)` 后只把 system 前置，然后把这个
+    # **Anthropic 形状的 body 原样发给 OpenAI 形态的上游** —— Anthropic 的
+    # `tools[{name, input_schema}]` 上游完全不认，`tool_use` / `tool_result`
+    # 内容块更是没人解析。表现就是 agent 型客户端调不动任何工具。
+    from admin.platform import protocol_bridge
+
+    normalized = protocol_bridge.anthropic_to_openai(body)
+    # 桥已把 system 抽成 role=system 消息，这里不再重复前置。
+    # 保留统一后的 max_tokens 口径（桥已处理），其余字段沿用原 body。
+    normalized["model"] = str(body.get("model") or normalized.get("model") or "")
+    if "stream" in body:
+        normalized["stream"] = bool(body.get("stream"))
 
     db = SessionLocal()
     try:
@@ -546,9 +555,12 @@ def _stream_anthropic(plan: dict, holder: dict | None = None):
                     "content": [], "stop_reason": None,
                     "usage": {"input_tokens": 0, "output_tokens": 0}},
     })
-    yield _anthropic_event("content_block_start", {
-        "type": "content_block_start", "index": 0,
-        "content_block": {"type": "text", "text": ""}})
+    # 内容块编号：文本块与各工具块各自占一个 index，且**惰性打开** ——
+    # 旧实现无条件先开一个 text 块，于是纯工具调用的回合会先多出一个空的
+    # text 块，严格客户端会把它渲染成一段空正文。
+    next_index = 0
+    text_index = None
+    open_tools: dict[int, str] = {}
 
     usage: dict = {}
     try:
@@ -560,20 +572,76 @@ def _stream_anthropic(plan: dict, holder: dict | None = None):
             choices = inner.get("choices") or []
             if choices:
                 delta = (choices[0] or {}).get("delta") or {}
-                if delta.get("content"):
+                text_piece = delta.get("content")
+                if text_piece:
+                    if text_index is None:
+                        text_index = next_index
+                        next_index += 1
+                        yield _anthropic_event("content_block_start", {
+                            "type": "content_block_start", "index": text_index,
+                            "content_block": {"type": "text", "text": ""}})
                     yield _anthropic_event("content_block_delta", {
-                        "type": "content_block_delta", "index": 0,
+                        "type": "content_block_delta", "index": text_index,
                         "delta": {"type": "text_delta",
-                                  "text": str(delta["content"])}})
+                                  "text": str(text_piece)}})
                 if delta.get("reasoning_content"):
+                    # thinking 块与正文共用 `text_index` 之外的位置会很乱；
+                    # 这里沿用「thinking 就是当前文本块的一种 delta」的既有口径，
+                    # 未开文本块时先开一个。
+                    if text_index is None:
+                        text_index = next_index
+                        next_index += 1
+                        yield _anthropic_event("content_block_start", {
+                            "type": "content_block_start", "index": text_index,
+                            "content_block": {"type": "text", "text": ""}})
                     yield _anthropic_event("content_block_delta", {
-                        "type": "content_block_delta", "index": 0,
+                        "type": "content_block_delta", "index": text_index,
                         "delta": {"type": "thinking_delta",
                                   "thinking": str(delta["reasoning_content"])}})
+                # ---- 工具调用帧 ----
+                # 旧实现完全不读 `delta["tool_calls"]`：工具调用在流式方向
+                # 被静默丢弃，客户端只会看到「助手说完了但没调工具」。
+                for call in (delta.get("tool_calls") or []):
+                    if not isinstance(call, dict):
+                        continue
+                    slot = call.get("index")
+                    if not isinstance(slot, int):
+                        slot = 0
+                    fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+                    if slot not in open_tools:
+                        # 新工具块：先关掉正在进行的文本块（Anthropic 不允许
+                        # 两个内容块同时打开）。
+                        if text_index is not None:
+                            yield _anthropic_event("content_block_stop", {
+                                "type": "content_block_stop", "index": text_index})
+                            text_index = None
+                        idx = next_index
+                        next_index += 1
+                        open_tools[slot] = idx
+                        yield _anthropic_event("content_block_start", {
+                            "type": "content_block_start", "index": idx,
+                            "content_block": {
+                                "type": "tool_use",
+                                "id": str(call.get("id") or ("call_%d" % slot)),
+                                "name": str(fn.get("name") or "unknown"),
+                                "input": {}}})
+                    idx = open_tools[slot]
+                    args = fn.get("arguments")
+                    if isinstance(args, str) and args:
+                        yield _anthropic_event("content_block_delta", {
+                            "type": "content_block_delta", "index": idx,
+                            "delta": {"type": "input_json_delta",
+                                      "partial_json": args}})
                 finish = (choices[0] or {}).get("finish_reason")
                 if finish:
-                    yield _anthropic_event("content_block_stop", {
-                        "type": "content_block_stop", "index": 0})
+                    if text_index is not None:
+                        yield _anthropic_event("content_block_stop", {
+                            "type": "content_block_stop", "index": text_index})
+                        text_index = None
+                    for idx in open_tools.values():
+                        yield _anthropic_event("content_block_stop", {
+                            "type": "content_block_stop", "index": idx})
+                    open_tools.clear()
                     yield _anthropic_event("message_delta", {
                         "type": "message_delta",
                         "delta": {"stop_reason": _stop_reason_of(finish)},
@@ -588,6 +656,13 @@ def _stream_anthropic(plan: dict, holder: dict | None = None):
         return
     finally:
         holder["usage"] = usage
+        # 收尾：任何还开着的块都必须 stop，否则客户端解析器会一直等。
+        for idx in list(open_tools.values()):
+            yield _anthropic_event("content_block_stop", {
+                "type": "content_block_stop", "index": idx})
+        if text_index is not None:
+            yield _anthropic_event("content_block_stop", {
+                "type": "content_block_stop", "index": text_index})
     yield _anthropic_event("message_stop", {"type": "message_stop"})
 
 
