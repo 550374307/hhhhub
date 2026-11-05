@@ -100,6 +100,15 @@ _DOCS_PATHS = {"/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json",
 app = FastAPI(title="WorkBuddy 共享管理后台", version="1.0",
               docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
 
+# 生产启动断言：配置不合规就让进程起不来。
+#
+# 放在 app 创建之后、注册任何业务路由之前 —— 越早失败，越不会出现
+# 「服务已经监听端口、但策略没生效」的窗口。非 prod 环境只做最危险误配的
+# 拦截（绑公网 + 本机免密标志同时成立），不影响本地开发与测试。
+from admin import env_guard
+
+env_guard.assert_boot_policy()
+
 @app.get("/api/settings/invitation")
 def get_invitation_setting(_: bool = Depends(require_admin), db=Depends(get_db)):
     from admin.invitation import current
@@ -138,8 +147,21 @@ app.add_middleware(
 
 @app.middleware("http")
 async def _security_headers(request: Request, call_next):
-    """统一安全响应头：防点击劫持 / MIME 嗅探 / 敏感头泄露。"""
-    if request.url.path in _DOCS_PATHS and not settings.ENABLE_DOCS:
+    """统一安全响应头 + 生产高危路径拦截。
+
+    ## 为什么高危路径在中间件层挡，而不是只依赖路由不挂载
+
+      * 平台目录是可裁剪的，`include_router` 成败取决于一堆 try/except；
+        漏挂是「没这个功能」，误挂就是「把宿主机交出去」。
+      * 这里是**第二道闸**：即使路由被挂上、即使有人后来改了
+        `include_router` 的条件，生产也访问不到。
+
+    返回体与「页面不存在」完全一致 —— 不告诉探测者「这个能力存在，只是被禁了」。
+    """
+    if request.url.path in _DOCS_PATHS and (
+            not settings.ENABLE_DOCS or env_guard.IS_PROD):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    if env_guard.is_prod_blocked(request.url.path):
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")

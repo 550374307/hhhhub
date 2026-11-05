@@ -21,6 +21,13 @@ if os.getenv("WORKBUDDY_DESKTOP") != "1" and os.getenv("WORKBUDDY_ANDROID") != "
 
 _logger = logging.getLogger(__name__)
 
+#: 运行环境。**必须在所有默认值之前读出来** —— 下面几项默认值要按环境分叉。
+#:
+#:   prod / staging / dev，写错任何一个都按 dev 处理会在生产留下开发面，
+#:   所以 `admin/env_guard.py` 会在启动时再断言一次（拼错直接拒绝启动）。
+_APP_ENV = (os.getenv("APP_ENV", "dev") or "dev").strip().lower()
+_IS_PROD = _APP_ENV == "prod"
+
 
 class Settings:
     LOG_REQUEST_PAYLOAD = os.getenv("ADMIN_LOG_REQUEST_PAYLOAD", "0") == "1"
@@ -125,8 +132,12 @@ class Settings:
     JWT_SECRET = _jwt
     JWT_EXPIRE_HOURS = int(os.getenv("ADMIN_JWT_EXPIRE_HOURS", "24"))
 
-    # 服务监听
-    HOST = os.getenv("ADMIN_HOST", "0.0.0.0")
+    # 服务监听。
+    #
+    # 生产默认 127.0.0.1：8790 只允许 nginx 反代进来，不做公网直连
+    # —— 直连意味着 nginx 上的 TLS / 限流 / IP 封禁全部失效。
+    # 本地/桌面/安卓仍默认 0.0.0.0（客户端从本机或局域网访问）。
+    HOST = os.getenv("ADMIN_HOST", "127.0.0.1" if _IS_PROD else "0.0.0.0")
     PORT = int(os.getenv("ADMIN_PORT", "8790"))
     # Only these direct peers may supply X-Real-IP / X-Forwarded-For.
     TRUSTED_PROXY_IPS = os.getenv("ADMIN_TRUSTED_PROXY_IPS", "127.0.0.1,::1")
@@ -181,9 +192,10 @@ class Settings:
     #: 逆向产物（客户端源码）管理：后台一键拆包 app.asar、手动指定安装目录。
     #:
     #: **只对开发/测试环境有意义**：生产服务器既没有客户端安装包，也不该在上面
-    #: 放 225MB 的源码。默认开启（本地开发方便），生产部署设为 0 即可整体关闭
+    #: 放 225MB 的源码。本地开发默认开启，**生产默认关闭**，且
+    #: `admin/env_guard.py` 会在 APP_ENV=prod 且显式开 1 时拒绝启动
     #: —— 关闭后 /api/app-source/* 全部返回 404，后台也不显示该区域。
-    DEV_TOOLS = os.getenv("ADMIN_DEV_TOOLS", "1") != "0"
+    DEV_TOOLS = os.getenv("ADMIN_DEV_TOOLS", "0" if _IS_PROD else "1") != "0"
 
     # ---------- 流量治理（限流 / 并发 / 保活） ----------
     #: 单账号最大在途请求数（0 = 不限）。
