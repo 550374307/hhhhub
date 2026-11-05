@@ -1,6 +1,7 @@
 """账号管理：列表 / 新增 / 批量上传 / 扫描本机 / 导入本机 / 刷新余额 / 启用禁用 / 删除 / 注入本机客户端。"""
 import glob
 import json
+import logging
 import os
 import shutil
 from datetime import datetime, timezone, timedelta
@@ -19,6 +20,14 @@ from admin.config import settings
 from admin.db import SessionLocal, get_db
 from admin.models import Account, AccountModelCooldown, ApiKey, ModelConfig, UsageLog
 from admin.security import require_admin, clean_display_name
+
+#: 本模块的日志器。
+#:
+#: 之前文件里有多处 `_logger.xxx(...)` 调用但**从未定义这个名字**
+#: （例如 `_schedule_automation` 的 except 分支），一旦走到就用
+#: `NameError` 把原始异常盖掉 —— 副作用是「自动任务失败」被报成
+#: 「_logger 未定义」，排查方向完全错。
+_logger = logging.getLogger("admin.accounts_router")
 
 router = APIRouter(prefix="/api/accounts", tags=["accounts"])
 
@@ -45,6 +54,13 @@ class AccountBatchIn(BaseModel):
 
 class InjectIn(BaseModel):
     confirm: bool = False
+    #: 是否允许在注入时**结束并重启**客户端进程。
+    #:
+    #: 默认关闭：注入成功后客户端内存里仍是旧会话，一次令牌刷新就会把
+    #: 文件重写回去（这就是 `needs_restart` 要传达的信息）。但"重启"意味着
+    #: 我们主动 kill 一个用户可能正在用的客户端，所以必须是显式选择，
+    #: 不能靠默认值代劳。
+    restart_client: bool = False
 
 
 class ImportLocalIn(BaseModel):
@@ -1217,15 +1233,26 @@ def inject_to_client(acc_id: int, body: InjectIn, _: bool = Depends(require_admi
     d = _client_auth_dir()
     if not os.path.isdir(d):
         raise HTTPException(status_code=500, detail=f"客户端登录目录不存在: {d}")
-    target = os.path.join(d, "workbuddy-desktop.info")
-    backup = None
-    if os.path.exists(target):
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup = target + f".bak-{ts}"
-        shutil.copy2(target, backup)
-    with open(target, "w", encoding="utf-8") as f:
-        f.write(raw)
-    return {"ok": True, "target": target, "backup": backup, "account": acc.name, "uid": acc.uid}
+    # 交给平台模块：同目录的 `.observation.json` 旁证必须一起改，
+    # 只覆盖 `.info` 会让客户端手里有两套「我是谁」（见 client_session 注释）。
+    from admin.platform.workbuddy.core import client_session
+
+    uid = str(acc.uid or "")
+    if not uid:
+        try:
+            uid = str(((json.loads(raw) or {}).get("account") or {}).get("uid") or "")
+        except Exception:  # noqa: BLE001 - 补不出来就按空 uid 继续
+            uid = ""
+    try:
+        result = client_session.inject(payload=raw, uid=uid, name=acc.name or "",
+                                       restart=bool(body.restart_client))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from None
+    except Exception as exc:  # noqa: BLE001 - 注入失败要说清原因，不能恒 200
+        _logger.warning("注入失败 acc=%s: %s", acc_id, exc)
+        raise HTTPException(status_code=500, detail=f"注入失败：{exc}") from None
+    result["account"] = acc.name
+    return result
 
 
 def _refresh_one_account(db, account) -> dict:

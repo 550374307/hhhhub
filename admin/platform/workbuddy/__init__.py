@@ -125,10 +125,40 @@ class WorkBuddyAccountOps:
 
         return accounts_router.health_check(account_id, _=True, db=db)
 
-    def inject(self, db, account_id):
-        from admin import client_profile
+    def inject(self, db, account_id, restart: bool = False):
+        """把号池里某账号注入成本机客户端的当前登录态。
 
-        return client_profile.inject(db, account_id)
+        历史实现调 `client_profile.inject(db, account_id)`，而
+        `admin/client_profile.py` 里**从来没有这个函数**（34 个公开函数里
+        没有 inject）—— 于是这条契约路径必然 `AttributeError`，平台无关的
+        「注入」入口是死的。实测：
+            AttributeError: module 'admin.client_profile' has no attribute 'inject'
+
+        改走 `workbuddy.core.client_session.inject()`：它同时改 `.info` 与
+        同目录的 `.observation.json` 旁证、原子写、写完读回来核对 uid，
+        并在客户端运行时如实回报 `needs_restart`，而不是假装成功。
+        """
+        from admin.platform.workbuddy.core import client_session
+        from admin.models import Account
+
+        acc = db.query(Account).filter(Account.id == account_id).first()
+        if acc is None:
+            raise ValueError("账号不存在: %s" % account_id)
+        from admin.credential_codec import normalize_credential
+
+        raw = normalize_credential(acc.auth_json)
+        uid = str(acc.uid or "")
+        if not uid:
+            # 少数历史账号 uid 列为空，从凭证里补一次
+            try:
+                import json as _json
+
+                payload = _json.loads(raw)
+                uid = str(((payload or {}).get("account") or {}).get("uid") or "")
+            except Exception:  # noqa: BLE001 - 补不出来就按空 uid 继续
+                uid = ""
+        return client_session.inject(payload=raw, uid=uid, name=acc.name or "",
+                                     restart=restart)
 
     def export(self, db, ids=None):
         from admin.routers import accounts as accounts_router
