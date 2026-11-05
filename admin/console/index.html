@@ -1354,10 +1354,10 @@
         </div>
         <div class="intake-actions">
           <button type="button" onclick="openPhoneLogin()" class="console-btn primary"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2" width="10" height="20" rx="2"/><path d="M11 18h2"/></svg>手机号登录</button>
-          <button type="button" onclick="openUpload()" class="console-btn "><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M4 16v4h16v-4"/></svg>导入账号</button>
+          <button type="button" onclick="openUpload()" class="console-btn "><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12m-4-4 4 4 4-4M4 16v4h16v-4"/></svg>导入账号</button>
           <span class="intake-divider" aria-hidden="true"></span>
           <button type="button" onclick="scanLocal()" class="console-btn quiet"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="13" rx="2"/><path d="M8 21h8m-4-5v5"/></svg>扫描本机</button>
-          <button type="button" onclick="openExport()" class="console-btn quiet"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4v12m-4-4 4 4 4-4M4 16v4h16v-4"/></svg>导出</button>
+          <button type="button" onclick="openExport()" class="console-btn quiet"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 16V4m-4 4 4-4 4 4M4 16v4h16v-4"/></svg>导出</button>
           <button type="button" onclick="openAddAccount()" class="console-btn quiet"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>手动添加</button>
         </div>
       </div>
@@ -4749,7 +4749,16 @@ function jsv(v){
  * 用法：ic('trash') / ic('spinner','wb-ic-spin') / ic('rotate','text-indigo-600')
  * 找不到的图标退化成空串而不是抛错 —— 少一个图标远好过整页白屏。 */
 function ic(name, cls) {
-  const path = (window.WB_ICON_PATHS || {})[name];
+  const table = window.WB_ICON_PATHS || {};
+  // `icons.js` 的 key **全部无前缀**（`triangle-exclamation`），但历史上有一批
+  // 调用点写成 FontAwesome 风格 `fa-triangle-exclamation`（`uiConfirm` 的
+  // 三个图标就是），查不到就返回空串 —— 表现是「删除确认框的图标是空白」，
+  // 而且不报错，很难发现。
+  //
+  // 在查表处统一抹平前缀，而不是去改几十个调用点：新写的代码两种写法都能用，
+  // 存量调用点也不必逐个审查。
+  const key = String(name || "").replace(/^fa[srb]?-/, "");
+  const path = table[name] || table[key];
   if (!path) return '';
   return `<svg class="wb-ic ${cls || ''}" viewBox="0 0 24 24" aria-hidden="true">${path}</svg>`;
 }
@@ -9402,7 +9411,7 @@ function keyRow(k) {
       <td class="px-4 py-3 text-right tnum">${k.unlimited?"∞":fmtNum(k.credit_limit)}</td>
       <td class="px-4 py-3 text-right tnum ${k.credit_used>=k.credit_limit&&!k.unlimited?'text-red-500':''}">${fmtNum(k.credit_used)}</td>
       <td class="px-4 py-3 text-right tnum" data-tooltip="并发与频率" data-tooltip-description="同一个 Key 的所有对话共享这里的并发上限和每分钟请求额度。空=跟随全局，0=不限。">${k.max_concurrent===0?'不限':(k.max_concurrent==null?'全局':k.max_concurrent)}<div class="text-xs text-slate-400">${k.rate_per_minute===0?'不限频率':(k.rate_per_minute==null?'频率随全局':k.rate_per_minute+' 次/分')}</div></td>
-      <td class="px-4 py-3"><button type="button" onclick="WBKeyIP.open(${Number(k.id)})" class="text-blue-600 whitespace-nowrap" data-tooltip="来源 IP" data-tooltip-description="查看该 Key 的来源 IP 与请求次数，用于识别共享范围与异常来源。"><span class="wb-icon mr-1"><svg class="wb-ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/></svg></span>${Number(k.ip_summary?.unique_ips || 0)} 个 / 24h</button><div class="mt-1 flex flex-wrap gap-1">${WBIP.concurrentTag(k.ip_summary?.active_requests)}${keyIpBadges(k.ip_summary)}</div></td>
+      <td class="px-4 py-3"><button type="button" onclick="WBKeyIP.open(${Number(k.id)})" class="text-blue-600 whitespace-nowrap" data-tooltip="来源 IP" data-tooltip-description="查看该 Key 的来源 IP 与请求次数，用于识别共享范围与异常来源。"><span class="wb-icon mr-1"><svg class="wb-ic" viewBox="0 0 24 24" aria-hidden="true"><rect x="16" y="16" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="9" y="2" width="6" height="6" rx="1"/><path d="M5 16v-3a1 1 0 0 1 1-1h12a1 1 0 0 1 1 1v3"/><path d="M12 12V8"/></svg></span>${Number(k.ip_summary?.unique_ips || 0)} 个 / 24h</button><div class="mt-1 flex flex-wrap gap-1">${typeof WBIP !== 'undefined' && typeof WBIP.concurrentTag === 'function' ? WBIP.concurrentTag(k.ip_summary?.active_requests) : ''}${keyIpBadges(k.ip_summary)}</div></td>
       <td class="px-4 py-3">${k.group_name
           ? `<span class="badge bg-indigo-100 text-indigo-700" data-tooltip="已绑定分组" data-tooltip-description="该 Key 仅可使用所绑定分组内的模型，组外模型会返回 403。">${esc(k.group_name)}</span>`
           : `<span class="text-xs text-slate-300" data-tooltip="全部模型" data-tooltip-description="未绑定分组，可用全部已启用的模型。">全部模型</span>`}</td>
