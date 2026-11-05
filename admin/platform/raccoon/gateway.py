@@ -357,7 +357,8 @@ def _bill(key, account, model, result, *, request, started=None, error="",
                 storage=raccoon_accounts.PLATFORM,
                 error_kind=error, client_ip=_client_ip(request),
                 use_case="raccoon-chat", seq=1,
-                ttfb_ms=ttfb, latency_ms=latency)
+                ttfb_ms=ttfb, latency_ms=latency,
+                reasoning_effort=shared.reasoning_effort_of_request(request))
     except Exception:  # noqa: BLE001
         logger.exception("小浣熊记账失败")
 

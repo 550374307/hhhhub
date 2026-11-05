@@ -374,7 +374,10 @@ def _bill(key, account, model, result, *, request, started=None, error="",
                 storage=loomy_accounts.PLATFORM,
                 error_kind=error, client_ip=_client_ip(request),
                 use_case="loomy-chat", seq=1,
-                ttfb_ms=ttfb, latency_ms=latency)
+                ttfb_ms=ttfb, latency_ms=latency,
+                # 思考档位是**观测字段**：不传的话用量日志里这个平台永远是
+                # 「未记录」，看起来像「用户没设」，实际是「网关没记」。
+                reasoning_effort=shared.reasoning_effort_of_request(request))
     except Exception:  # noqa: BLE001
         logger.exception("Loomy 记账失败")
 

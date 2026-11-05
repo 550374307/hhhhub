@@ -957,7 +957,8 @@ def _bill_solo(db, key, account, model, usage, started, request, error="",
             storage="trae", error_kind=error,
             client_ip=_client_ip(request),
             use_case="trae-solo-chat",
-            ttfb_ms=ttfb, latency_ms=latency)
+            ttfb_ms=ttfb, latency_ms=latency,
+            reasoning_effort=shared.reasoning_effort_of_request(request))
     except Exception:  # noqa: BLE001
         logger.exception("SOLO 记账失败")
 
@@ -1017,7 +1018,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
                 # `deepseek-V3`）。展示成真名更利于排障，也便于客户端复制。
                 result["model"] = (holder.get("meta") or {}).get("model") or model
             _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/chat/completions", started=started)
+"/v1/chat/completions", started=started, request=request)
             return JSONResponse(result or {})
 
         def render_stream(resp, hold):
@@ -1036,7 +1037,7 @@ async def chat_completions(request: Request) -> StreamingResponse | JSONResponse
         cleanup = make_cleanup(
             lambda: (_release(holder),
                      _bill(key, account, model, holder, ip, ttfb, attempted,
-                           "/v1/chat/completions", started=started)),
+                           "/v1/chat/completions", started=started, request=request)),
             on_error="Trae 流式清理失败（chat）")
 
         def generator():
@@ -1102,7 +1103,7 @@ async def responses(request: Request) -> StreamingResponse | JSONResponse:
                 render=render, sticky_key=sticky, use_case=USE_CASE["/v1/responses"])
             _release(holder)
             _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/responses", started=started)
+"/v1/responses", started=started, request=request)
             return JSONResponse(protocol.chat_to_responses(result or {}, model))
 
         def render_stream(resp, hold):
@@ -1115,7 +1116,7 @@ async def responses(request: Request) -> StreamingResponse | JSONResponse:
         cleanup = make_cleanup(
             lambda: (_release(holder),
                      _bill(key, account, model, holder, ip, ttfb, attempted,
-                           "/v1/responses", started=started)),
+                           "/v1/responses", started=started, request=request)),
             on_error="Trae 流式清理失败（responses）")
 
         def generator():
@@ -1179,7 +1180,7 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
                 render=render, sticky_key=sticky, use_case=USE_CASE["/v1/messages"])
             _release(holder)
             _bill(key, account, model, holder, ip, ttfb, attempted,
-"/v1/messages", started=started)
+"/v1/messages", started=started, request=request)
             return JSONResponse(protocol.chat_to_messages(result or {}, model))
 
         def render_stream(resp, hold):
@@ -1192,7 +1193,7 @@ async def messages(request: Request) -> StreamingResponse | JSONResponse:
         cleanup = make_cleanup(
             lambda: (_release(holder),
                      _bill(key, account, model, holder, ip, ttfb, attempted,
-                           "/v1/messages", started=started)),
+                           "/v1/messages", started=started, request=request)),
             on_error="Trae 流式清理失败（messages）")
 
         def generator():
@@ -1358,7 +1359,7 @@ async def _json_body(request: Request) -> dict:
 
 
 def _bill(key, account, model, holder, ip, ttfb_ms, attempted, path,
-          started=None) -> None:
+          started=None, request=None) -> None:
     """记一条用量（独立 session，绝不影响已返回的响应）。
 
     `started` 是请求开始时的 `time.perf_counter()`。用它算**总耗时**，
@@ -1387,6 +1388,11 @@ def _bill(key, account, model, holder, ip, ttfb_ms, attempted, path,
                 ttfb_ms=ttfb or total_ms,
                 latency_ms=total_ms or ttfb,
                 realm=str(holder.get("realm") or ""),
+                # `request` 是可选形参：老调用点不传也不报错（档位记空），
+                # 传了就按 `scope["_wb_body"]` 解析。用可选参数而不是改全部
+                # 6 个调用点，是为了让 diff 聚焦在记账本身。
+                reasoning_effort=(shared.reasoning_effort_of_request(request)
+                                  if request is not None else ""),
             )
     except Exception:  # noqa: BLE001
         logger.exception("trae 记账失败 path=%s", path)

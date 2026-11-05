@@ -246,7 +246,8 @@ def _bill(key, account, model, usage, *, request, ttfb_ms=0, latency_ms=0,
                 client_ip=_client_ip(request),
                 use_case="qoder-" + (request.url.path.rsplit("/", 1)[-1] or "chat"),
                 seq=seq, ttfb_ms=ttfb_ms,
-                latency_ms=latency_ms or _elapsed_ms(started) or ttfb_ms)
+                latency_ms=latency_ms or _elapsed_ms(started) or ttfb_ms,
+                reasoning_effort=shared.reasoning_effort_of_request(request))
     except Exception:  # noqa: BLE001
         logger.exception("Qoder 记账失败")
 

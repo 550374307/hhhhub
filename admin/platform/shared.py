@@ -74,6 +74,72 @@ class PlatformRejected(Exception):
 
 
 # ---------------------------------------------------------------------------
+# 思考档位（记账用）
+# ---------------------------------------------------------------------------
+#: 认可的下游思考档位（OpenAI 的 minimal~high + 一些客户端的 xhigh/max/ultra）。
+REASONING_EFFORTS = frozenset({
+    "off", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    "auto",
+})
+
+
+def reasoning_effort_of(body: dict) -> str:
+    """从下游请求体里读出「思考程度」，只保留有限枚举，绝不落原始 payload。
+
+    三种写法都要认（客户端方言不统一）：
+
+    * OpenAI：`reasoning_effort: "high"`
+    * Responses：`reasoning: {"effort": "high"}`
+    * Anthropic：`thinking: {"type": "enabled", "budget_tokens": 8192}`
+
+    Anthropic 没有档位概念、只有预算，所以按预算记成 `budget:<n>`；
+    这比「统一折算成 high」更诚实 —— 日志里要能看出客户端到底要了多少。
+
+    **为什么必须放 shared**：以前只有 WorkBuddy 主链路（proxy.py）记了它，
+    Loomy / Qoder / Trae / Raccoon 各自记账时一个字都没传，于是用量日志里
+    这些平台永远是「默认 / 未记录」—— 看起来像「用户没设」，
+    实际是「网关没记」。
+    """
+    if not isinstance(body, dict):
+        return ""
+    effort = body.get("reasoning_effort") or body.get("reasoningEffort")
+    reasoning = body.get("reasoning")
+    if not effort:
+        effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
+    if isinstance(effort, str) and effort.strip().lower() in REASONING_EFFORTS:
+        return effort.strip().lower()
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict):
+        if thinking.get("type") == "disabled":
+            return "off"
+        budget = thinking.get("budget_tokens")
+        if (isinstance(budget, int) and not isinstance(budget, bool)
+                and 0 <= budget <= 10 ** 9):
+            return "budget:%d" % budget
+        if thinking.get("type") in ("enabled", "adaptive"):
+            return str(thinking["type"])
+    return ""
+
+
+def reasoning_effort_of_request(request) -> str:
+    """从请求作用域里取原始 body 再解析档位（记账用）。
+
+    `PlatformDispatchMiddleware` 会把预读到的（并已按目标平台改写 model 的）
+    body 缓存在 `scope["_wb_body"]` 里，所以记账时不必让每个调用点都把
+    body 一路传下来 —— 平台网关的 `_bill()` 只有 request 没有 body。
+
+    解析失败一律返回空串：档位是**观测字段**，绝不能因为它让记账失败。
+    """
+    try:
+        raw = request.scope.get("_wb_body")
+        if isinstance(raw, (bytes, bytearray)) and raw:
+            return reasoning_effort_of(json.loads(raw))
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # 平台判定
 # ---------------------------------------------------------------------------
 def request_token(request) -> str:
