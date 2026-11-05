@@ -442,6 +442,89 @@ def _():
 
 
 # --------------------------------------------------------------------------
+# 10. codearts 平台（本轮新接入）
+# --------------------------------------------------------------------------
+@check("codearts: 平台已注册且六个平台全部装载")
+def _():
+    from admin.platform import loader, registry
+
+    res = loader.load_platforms()
+    loaded = res.get("loaded") if isinstance(res, dict) else None
+    if loaded is not None:
+        assert "admin.platform.codearts" in loaded, loaded
+    spec = registry.get("codearts")
+    assert spec is not None, "codearts 未注册"
+    assert spec.storage() == "codearts"
+
+
+@check("codearts: 签名器确定性 + SDK-HMAC-SHA256 形态")
+def _():
+    from admin.platform.codearts.core import signer
+
+    kwargs = dict(headers={"Content-Type": "application/json"},
+                  body='{"a":1}', access_key="AK", secret_key="SK",
+                  now=1700000000.0)
+    h1 = signer.sign("POST", "https://example.com/v1/chat", **kwargs)
+    h2 = signer.sign("POST", "https://example.com/v1/chat", **kwargs)
+    assert h1 == h2, "同样输入必须得到同样签名"
+    auth = h1.get("Authorization", "")
+    assert auth.startswith("SDK-HMAC-SHA256 "), auth[:40]
+    assert "Access=AK" in auth, auth
+    assert h1.get("X-Sdk-Date"), h1
+
+
+@check("codearts: AccountOps 契约方法齐全")
+def _():
+    from admin.platform.codearts.platform_gateway import CodeArtsAccountOps
+
+    need = {"list", "scan", "import_local", "import_record", "import_batch",
+            "refresh", "health", "export", "credits", "usage", "inject"}
+    have = {n for n in dir(CodeArtsAccountOps) if not n.startswith("_")}
+    missing = need - have
+    assert not missing, "缺方法: %s" % missing
+
+
+@check("codearts: scan() 带 supported 字段（客户端没装也不误报）")
+def _():
+    from admin.platform.codearts.platform_gateway import CodeArtsAccountOps
+
+    r = CodeArtsAccountOps("cn").scan()
+    assert r.get("supported") is True, r
+    # 本机没装客户端时必须是「扫到了 0 个」而不是「不支持」
+    assert isinstance(r.get("items"), list), r
+
+
+@check("shared: 分页/过滤/排序/聚合四个 helper 可用")
+def _():
+    from admin.platform import shared
+
+    class Req:
+        query_params = {"page": "2", "page_size": "10", "search": "x",
+                        "sort": "name_asc"}
+
+    p = shared.list_page_params(Req())
+    assert p["paginated"] is True and p["page"] == 2 and p["page_size"] == 10
+    assert p["search"] == "x" and p["sort"] == "name_asc"
+
+    class NoPage:
+        query_params = {}
+
+    n = shared.list_page_params(NoPage())
+    assert n["paginated"] is False, "无 page 必须保持旧的全量行为"
+
+
+@check("shared: kick_background_refresh 单飞 + 限频")
+def _():
+    from admin.platform import shared
+
+    assert shared.kick_background_refresh("t-empty", [], lambda s, a: None) is False
+    first = shared.kick_background_refresh("t-single", [999999], lambda s, a: None)
+    assert first is True, "首次应接受"
+    second = shared.kick_background_refresh("t-single", [999999], lambda s, a: None)
+    assert second is False, "限频内必须拒绝"
+
+
+# --------------------------------------------------------------------------
 def _say(text):
     """打印一行。编码不支持时退化成 ASCII 安全形式，绝不让编码问题影响判定。"""
     try:
