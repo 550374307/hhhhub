@@ -774,8 +774,31 @@ SANITIZE_REWRITES = _PROMPT_TEMPLATE_REWRITES + (
     ("11128", "11-128"),
 )
 
-_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header:[^;\n]*;?\s*")
+# 计费指纹来自 Claude Code：它把渠道元数据当**一整行纯文本**塞进 system 的
+# text block，例如
+#   "x-anthropic-billing-header: cc_version=2.1.310.8ea; cc_entrypoint=sdk-cli;"
+# 它不是协议字段，上游只拿它做「是否官方客户端」的渠道识别。
+#
+# ## 为什么必须整行删（2026-11-05 修正）
+#
+# 旧实现用 `:[^;\n]*;?\s*`，**吃到第一个分号就停**。于是
+#   "x-anthropic-billing-header: cc_version=1.2.3; cc_entrypoint=cli; cch=abc;"
+# 只会被删成 "; cch=abc123def;" —— 而 `cch=` 正是渠道校验哈希，残留即指纹。
+# 更糟的是 `has_fingerprint()` 随后返回 False（`x-anthropic-billing-header`
+# 已经被删掉了），`_sanitize_non_repository_text()` 在开头就 return，
+# 下面 `_KV_RE` / `cc_` 那几层补偿**全都不会执行**。实测就是这么漏出去的。
+#
+# 整行正则必须**只匹配「整行都是指纹」**：若同一行后面还有自然语言，
+# 交给 `_HDR_INLINE_RE` 只删到分号，避免把用户正文一起吞掉。
+_HDR_LINE_RE = re.compile(
+    r"(?im)^[ \t]*x-anthropic-billing-header[ \t]*:[ \t]*"
+    r"(?:[A-Za-z0-9_.\-]+=[^\s;\n]*;?[ \t]*)+[ \t]*(?:\r?\n|$)")
+_HDR_INLINE_RE = re.compile(r"(?i)x-anthropic-billing-header[ \t]*:[^;\n]*;?")
+#: 兼容旧名，保留给外部引用。新代码请用 `_HDR_INLINE_RE`。
+_HDR_RE = _HDR_INLINE_RE
 _BARE_HDR_RE = re.compile(r"(?i)x-anthropic-billing-header")
+#: 渠道校验哈希 `cch=<hex>`：即使指纹行删掉了它也会单独残留，必须独立清理。
+_CCH_RE = re.compile(r"(?i)\bcch=[0-9a-f]{1,64}\b;?[ \t]*")
 # cc_* kv：值到 `;`、空白或行尾为止。**不能**用 [^;\n]* —— 没有 `;` 时会把
 # 整行剩余内容一起吞掉（实测 "cmd cc_entrypoint=cli cc_version=1.2 tail"
 # 会被吃成 "cmd"）。故用非贪婪 + 前瞻定界。
@@ -789,7 +812,10 @@ def has_fingerprint(text: str) -> bool:
         if f in text:
             return True
     # 大小写混合 + 裸键名（无冒号）也要兜住
-    return bool(_BARE_HDR_RE.search(text))
+    if _BARE_HDR_RE.search(text):
+        return True
+    # 指纹行被删掉后可能只剩渠道哈希，它同样是可识别特征。
+    return bool(_CCH_RE.search(text))
 
 
 def sanitize_text(text: str) -> str:
@@ -798,19 +824,36 @@ def sanitize_text(text: str) -> str:
     return rewritten.strip() if rewritten != text else text
 
 
+def _strip_billing_fingerprint(text: str) -> str:
+    """删掉文本里的计费指纹，**不依赖 `has_fingerprint()` 的前置判断**。
+
+    顺序即语义：先删整行（干净情况），再删行内残留，最后清 `cc_*` 与 `cch=`。
+    三步都不能省 —— 整行正则要求「整行都是指纹」，混在正文里的情况只有
+    `_HDR_INLINE_RE` 能覆盖；而两轮删除后仍可能剩下孤立的 `;`/`cc_*`/`cch=`。
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if _HDR_LINE_RE.search(text):
+        text = _HDR_LINE_RE.sub("", text)
+    if _HDR_INLINE_RE.search(text):
+        text = _HDR_INLINE_RE.sub("", text)
+    if "cc_" in text:
+        prev = None
+        while prev != text:  # 多个尾随 kv，循环到不动点
+            prev = text
+            text = _KV_RE.sub("", text)
+    if _CCH_RE.search(text):
+        text = _CCH_RE.sub("", text)
+    return text
+
+
 def _sanitize_non_repository_text(text: str) -> str:
     if not has_fingerprint(text):
         return text
     for src, dst in SANITIZE_REWRITES:
         if src in text:
             text = text.replace(src, dst)
-    if _HDR_RE.search(text):
-        text = _HDR_RE.sub("", text)
-    if "cc_" in text:
-        prev = None
-        while prev != text:  # 多个尾随 kv，循环到不动点
-            prev = text
-            text = _KV_RE.sub("", text)
+    text = _strip_billing_fingerprint(text)
     text = _BARE_HDR_RE.sub("x-anthropic-billing-hdr", text)
     return text
 
@@ -1487,6 +1530,59 @@ def normalize_prompt_templates(obj: dict) -> int:
     return count
 
 
+def strip_harness_billing_header(obj: dict) -> int:
+    """删除 system/developer 里的计费指纹行，返回命中的消息数。
+
+    与「敏感词脱敏」是两件事，**不受脱敏开关控制**：删的不是内容措辞，
+    而是一段与对话无关的客户端渠道指纹。三种残留一并处理：
+      · 指纹后面还跟着 `cch=<hex>` → 一起删；
+      · 文本块被删空 → 从 content 数组摘掉，不留空 text block；
+      · 整条消息只剩指纹 → 连消息一起删（空 content 的 system 消息
+        部分上游直接 400）。
+    """
+    messages = obj.get("messages")
+    if not isinstance(messages, list):
+        return 0
+    removed = 0
+    kept_messages = []
+    for message in messages:
+        if (not isinstance(message, dict)
+                or message.get("role") not in ("system", "developer")):
+            kept_messages.append(message)
+            continue
+        content = message.get("content")
+        touched = False
+        if isinstance(content, str):
+            if _HDR_LINE_RE.search(content) or _HDR_INLINE_RE.search(content):
+                cleaned = _strip_billing_fingerprint(content)
+                message = dict(message, content=cleaned.strip())
+                touched = True
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if (isinstance(part, dict) and part.get("type") in ("text", "input_text")
+                        and isinstance(part.get("text"), str)
+                        and (_HDR_LINE_RE.search(part["text"])
+                             or _HDR_INLINE_RE.search(part["text"]))):
+                    touched = True
+                    text = _strip_billing_fingerprint(part["text"])
+                    if text.strip():
+                        parts.append(dict(part, text=text))
+                    continue
+                parts.append(part)
+            if touched:
+                message = dict(message, content=parts)
+        if touched:
+            removed += 1
+            payload = message.get("content")
+            if not payload or (isinstance(payload, str) and not payload.strip()):
+                continue
+        kept_messages.append(message)
+    if removed:
+        obj["messages"] = kept_messages
+    return removed
+
+
 def normalize_harness_body(obj: dict) -> dict:
     """所有客户端共用的最小上游兼容处理，按请求内容而非客户端名称判断。
 
@@ -1505,7 +1601,7 @@ def normalize_harness_body(obj: dict) -> dict:
       3. 身份声明句式归一（DSH 使用官方介绍句式，不依赖可选脱敏）。
       4. 固定模板归一（全局去掉主分支说明中的已知不兼容括号注释）。
 
-    返回 roles / orphans / identity / templates 改写统计，
+    返回 roles / orphans / identity / templates / billing 改写统计，
     obj 就地改写，调用方原样发送即可。
     """
     shielded = shield_harness_prompt(obj)
@@ -1514,6 +1610,9 @@ def normalize_harness_body(obj: dict) -> dict:
         "orphans": cleanup_orphan_tool_calls(obj),
         "identity": normalize_harness_identity(obj),
         "templates": normalize_prompt_templates(obj),
+        # 计费指纹必须在 role 归一**之后**删：developer→system 会把原本不在
+        # system 里的指纹行搬进来，先删后搬等于白删。
+        "billing": strip_harness_billing_header(obj),
         "shield": shielded,
     }
 
@@ -1737,6 +1836,9 @@ def prepare_upstream_body(obj: dict, *, sanitize: bool = False,
     apply_thinking_intent(obj, supported=supported_efforts)
     normalize_reasoning_effort(obj, supported_efforts)
     backfill_reasoning_content(obj)
+    # 计费指纹**无条件**删，不受 `sanitize` 开关控制：它不是内容措辞，
+    # 而是渠道校验特征，留着上游就按「非官方客户端」拦（11128）。
+    strip_harness_billing_header(obj)
     if sanitize:
         sanitize_messages(obj)
     return obj

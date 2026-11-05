@@ -37,6 +37,9 @@ from upstream_compat import (
     cleanup_orphan_tool_calls,
     validate_tool_pairing,
     normalize_harness_body,
+    sanitize_messages,
+    sanitize_text,
+    strip_harness_billing_header,
 )
 
 HTTP_LIMITS = backend.HTTP_LIMITS
@@ -200,6 +203,62 @@ def _tool_diag(chat_body: dict) -> str:
         return f"diag-failed:{e}"
 
 
+def _strip_channel_fingerprints(chat_body: dict) -> int:
+    """删掉客户端渠道指纹，与 converter /gw 的 `prepare_upstream_body` 同款。
+
+    **顺序是语义**：必须先把 `x-anthropic-billing-header` 整行删掉，**再**做
+    零宽空格脱敏。脱敏会在词内部插 U+200B，`_HDR_RE` 之后就再也匹配不到这个
+    头；而上游会归一化零宽字符，于是「看起来改过了，字面仍然成立」——
+    这正是 400/11128 长期稳定在 4~6% 的成因
+    （实测：AUX 带 billHdr 88.4% 被拒，不带 4.3%）。
+
+    这一步**不受 `ANTHROPIC_DESENSITIZE` 开关约束**：指纹是渠道校验，
+    不是内容审核，关掉脱敏不该让指纹漏出去。
+    """
+    try:
+        n = strip_harness_billing_header(chat_body)
+        n += sanitize_messages(chat_body)
+        tools = chat_body.get("tools")
+        if isinstance(tools, list):
+            for tool in tools:
+                fn = tool.get("function") if isinstance(tool, dict) else None
+                if isinstance(fn, dict) and isinstance(fn.get("description"), str):
+                    new = sanitize_text(fn["description"])
+                    if new != fn["description"]:
+                        fn["description"] = new
+                        n += 1
+        # 指纹整行删掉后，system 消息可能只剩空串。空 content 的 system
+        # 消息一部分上游直接 400，所以整条摘掉（只摘 system/developer，
+        # user/assistant 的空消息是合法的「本轮无正文」）。
+        _drop_emptied_system_messages(chat_body)
+        return n
+    except Exception as e:  # noqa: BLE001 - 净化失败不该打死主链路
+        _logger.warning("[fingerprint] 净化失败，按原样发送：%s", e)
+        return 0
+
+
+def _drop_emptied_system_messages(chat_body: dict) -> int:
+    """摘掉被净化成空壳的 system/developer 消息，返回摘掉的条数。"""
+    msgs = chat_body.get("messages")
+    if not isinstance(msgs, list):
+        return 0
+    kept = []
+    dropped = 0
+    for m in msgs:
+        if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+            content = m.get("content")
+            empty = (content is None
+                     or (isinstance(content, str) and not content.strip())
+                     or (isinstance(content, list) and not content))
+            if empty and not m.get("tool_calls"):
+                dropped += 1
+                continue
+        kept.append(m)
+    if dropped:
+        chat_body["messages"] = kept
+    return dropped
+
+
 def _desensitize_chat_body(chat_body: dict) -> dict:
     """harness 脱敏（CC / OpenAI 反代 / converter /gw 共用同一套）。
 
@@ -207,7 +266,12 @@ def _desensitize_chat_body(chat_body: dict) -> dict:
     误判成敏感内容并整条拒绝（典型 11128 "unapproved channel"）。
     /v1/messages 早就做了这一步；/v1/chat/completions、/v1/responses 若不同步，
     就会出现「CC 能用、OpenAI 反代发不出去」。
+
+    指纹净化在开关判断**之前**无条件执行，见 `_strip_channel_fingerprints`。
     """
+    removed = _strip_channel_fingerprints(chat_body)
+    if removed:
+        _logger.info("[fingerprint] 客户端指纹净化 %d 处", removed)
     if not (_DESENSITIZE_AVAILABLE and settings.ANTHROPIC_DESENSITIZE):
         return chat_body
     try:
