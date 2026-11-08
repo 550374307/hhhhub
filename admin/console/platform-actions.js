@@ -42,18 +42,31 @@
       '<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="8" width="18" height="13" rx="2"/><path d="M3 12h18M12 8v13M12 8a3 3 0 1 0-3-3c0 2 3 3 3 3zm0 0a3 3 0 1 1 3-3c0 2-3 3-3 3z"/></svg>',
     key:
       '<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3M14 9l3 3"/></svg>',
+    upload:
+      '<svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20V8m-4 4 4-4 4 4M4 6h16"/></svg>',
   };
 
   /* 动作 -> 展示配置。**只有展示信息，能力由后端决定** */
   var ACTION_META = {
     scan: { label: "扫描本机", icon: "search" },
-    import: { label: "导入本机", icon: "download", primary: true },
+    // 导入 = **选文件 / 粘贴**（支持本网关导出的 .json / .jsonl）。
+    // 以前这里的 import 走的是「扫描本机登录态」，跟「扫描」按钮做的是
+    // 同一件事，用户根本找不到「把导出的账号导回来」的入口。
+    import: { label: "导入账号", icon: "download", primary: true },
+    "import-file": { label: "导入账号", icon: "upload" },
+    // 导出号池（含明文凭证 / 脱敏清单两种模式）
+    export: { label: "导出", icon: "download" },
     "refresh-quota": { label: "刷新额度", icon: "refresh" },
     usage: { label: "用量明细", icon: "chart" },
     // Trae 的 Cookie 只用于「查询用量明细」，不是登录手段 ——
     // 名字里写清楚，避免用户以为要靠贴 Cookie 才能登录。
     "web-cookie": { label: "用量 Cookie", icon: "cookie" },
     checkin: { label: "签到领取", icon: "gift" },
+    // 每日活跃对话：不是签到也不是刷额度，是真发一条对话维持账号画像。
+    // 只在确实实现了 /api/<storage>/activity 的平台上由后端声明。
+    activity: { label: "活跃对话", icon: "refresh" },
+    // 失效复检：disabled 的号再探一次，能通就自动恢复。
+    "ban-recheck": { label: "失效复检", icon: "refresh" },
     "begin-auth": { label: "授权登录", icon: "key", primary: true },
   };
 
@@ -109,14 +122,21 @@
       }
     }
 
+    /* 同一组里只留一个主按钮。
+       授权登录和导入账号都声明了 primary，并排渲染就是两块蓝 —— 视觉上
+       分不出"下一步该点哪个"。这里按声明顺序取第一个，其余降级为
+       普通按钮；两处渲染（页头 / 平台卡）共用本函数，改一处即可。 */
+    var primaryTaken = false;
     return declared
       .map(function (name) {
         var meta = ACTION_META[name] || { label: name, icon: "key" };
+        var isPrimary = Boolean(meta.primary) && !primaryTaken;
+        if (isPrimary) primaryTaken = true;
         return {
           name: name,
           label: meta.label,
           icon: meta.icon,
-          primary: Boolean(meta.primary),
+          primary: isPrimary,
         };
       })
       .filter(function (item) {

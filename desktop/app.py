@@ -210,7 +210,8 @@ def configure_environment(base: Path) -> dict:
     if "converter_api_key" not in config:
         config["converter_api_key"] = "wb-" + secrets.token_urlsafe(32)
         atomic_json(file, config)
-    os.environ.update({"WORKBUDDY_DESKTOP": "1", "WORKBUDDY_DESKTOP_DATA": str(base),
+    os.environ.update({"WORKBUDDY_DESKTOP": "1", "WORKBUDDY_CLIENT_RUNTIME": "1",
+                       "WORKBUDDY_DESKTOP_DATA": str(base),
                        "ADMIN_DATABASE_URL": "sqlite:///" + (base / "workbuddy.db").as_posix(),
                        "ADMIN_GATEWAY_LIMIT_BACKEND": "memory", "ADMIN_HOST": "0.0.0.0",
                        "ADMIN_USERNAME": config["username"], "ADMIN_PASSWORD": config["password"],
@@ -337,6 +338,18 @@ class Bridge:
             if str(window.native.WindowState) == "Maximized":
                 window.restore()
             else:
+                # ⚠️ frameless 窗口直接 Maximized 会**盖住系统任务栏**：
+                # 无边框表单最大化时 WinForms 不按工作区裁剪，而是铺满整屏。
+                # 先把 MaximizedBounds 钉到「屏幕工作区」（扣掉任务栏），
+                # 再最大化 —— 点最大化按钮后就不再遮任务栏。
+                try:
+                    from System.Windows.Forms import Screen
+                    native = window.native
+                    screen = Screen.FromHandle(native.Handle)
+                    native.MaximizedBounds = screen.WorkingArea
+                except Exception:
+                    logging.debug("MaximizedBounds 设置失败，退回默认最大化",
+                                  exc_info=True)
                 window.maximize()
         elif action == "close":
             window.destroy()

@@ -287,14 +287,17 @@
     });
   }
 
-  // 邀请码：**不再从 URL 查询参数预填**。
+  // 2026-11-05：**不再从 URL 查询参数预填邀请码**。
   //
-  // `?invite_code=MH-xxxx` 会原样进 nginx access log、浏览器历史、Referer，
-  // 以及任何拿到这条链接的人都能读到的书签 —— 等于把一张可用凭证写在日志里。
+  // `?invite_code=MH-xxxx` 会原样进 nginx access log、浏览器历史、
+  // 以及页面里任何第三方资源的 Referer —— 等于把一张可用凭证写在日志里。
   // 服务端已同步删掉 query 分支（admin/routers/login.py:_extract_invite_code），
   // 所以这里预填也没有意义：填了也过不了校验。
   //
-  // 分享请用请求体字段或 `X-Join-Invite` 头；前端仍保留输入框供手动粘贴。
+  // 现在的分享链路是：
+  //     /j#k=<一次性票据>  →  换 join_access Cookie  →  /join
+  // 邀请码只由用户手动填写，走 POST body / X-Join-Invite 头；
+  // 前端仍保留输入框供手动粘贴。
   var INVITE = "";
 
   function inviteValue() {

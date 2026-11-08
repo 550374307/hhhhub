@@ -21,8 +21,7 @@ if os.getenv("WORKBUDDY_DESKTOP") != "1" and os.getenv("WORKBUDDY_ANDROID") != "
 
 _logger = logging.getLogger(__name__)
 
-#: 运行环境。**必须在所有默认值之前读出来** —— 下面几项默认值要按环境分叉。
-#:
+#: 运行环境。**必须在所有默认值之前读出来** —— 下面好几项默认值要按环境分叉。
 #:   prod / staging / dev，写错任何一个都按 dev 处理会在生产留下开发面，
 #:   所以 `admin/env_guard.py` 会在启动时再断言一次（拼错直接拒绝启动）。
 _APP_ENV = (os.getenv("APP_ENV", "dev") or "dev").strip().lower()
@@ -51,8 +50,19 @@ class Settings:
     # 不会让吞吐变差，只会让慢请求有机会跑完。
     GATEWAY_REQUEST_TIMEOUT = max(1.0, min(900.0, float(os.getenv("ADMIN_GATEWAY_REQUEST_TIMEOUT", "300"))))
     JOIN_MAX_CONCURRENT = max(1, int(os.getenv("ADMIN_JOIN_MAX_CONCURRENT", "4")))
-    GATEWAY_RATE_PER_MINUTE = int(os.getenv("ADMIN_GATEWAY_RATE_PER_MINUTE", "60"))
-    GATEWAY_MAX_CONCURRENT = int(os.getenv("ADMIN_GATEWAY_MAX_CONCURRENT", "4"))
+    # 每个 Key 的每分钟请求数 / 同时在途数（Key 上填了值就以 Key 为准）。
+    #
+    # 2026-11-04 实测（单 Key，逐档加压，5 个平台 × 1~32 并发）：
+    #   · 默认 60/分钟会让 16 并发被**匀速放行**：Loomy 的 TTFT 从 1.6s
+    #     一路涨到 21.9s，看起来像"上游扛不住"，实际是准入层在排队；
+    #   · WorkBuddy 32 并发：TTFT 7.0s、TPS 49.7，与 1 并发的 4.6s/46.9
+    #     基本持平 —— 说明池子够大时并发可以拉满；
+    #   · Qoder 1~2 并发：TTFT 1.0~1.2s、TPS 175~193，余量充足。
+    #
+    # 所以默认放到 300/分钟 + 24 并发：够 agent 的工具循环跑，又不会在
+    # 单号池上瞬间打爆上游（每号在途上限 3 才是真正的背压）。
+    GATEWAY_RATE_PER_MINUTE = int(os.getenv("ADMIN_GATEWAY_RATE_PER_MINUTE", "300"))
+    GATEWAY_MAX_CONCURRENT = int(os.getenv("ADMIN_GATEWAY_MAX_CONCURRENT", "24"))
     GATEWAY_LIMIT_BACKEND = os.getenv("ADMIN_GATEWAY_LIMIT_BACKEND", "auto").lower()
     # Per-upstream-account start pacing is independent of per-key concurrency/RPM.
     UPSTREAM_START_INTERVAL_MS = int(os.getenv("ADMIN_UPSTREAM_START_INTERVAL_MS", "75"))
@@ -130,7 +140,47 @@ class Settings:
     if len(_jwt) < 16:
         _logger.warning("ADMIN_JWT_SECRET 长度不足 16 字符，建议使用 >=32 字节的随机串")
     JWT_SECRET = _jwt
-    JWT_EXPIRE_HOURS = int(os.getenv("ADMIN_JWT_EXPIRE_HOURS", "24"))
+    # 后台会话有效期（小时）。
+    #
+    # 2026-11-05 从 24 收到 4：令牌即便只存在 HttpOnly Cookie 里，被偷一次
+    # 也意味着 24 小时的全量号池访问权。4 小时足够一次运维班次，超出就重登。
+    # 生产启动断言另有一条「<= 8」的硬上限（见 admin/env_guard.py）。
+    JWT_EXPIRE_HOURS = int(os.getenv("ADMIN_JWT_EXPIRE_HOURS", "4"))
+
+    # ---------- 后台会话策略（2026-11-05 加固） ----------
+    #: 是否开启「同一账号只允许一个有效会话」。
+    #:
+    #: 开启后：每次登录都会**吊销此前签发的全部会话**，旧标签页/旧设备立刻失效。
+    #: 这是「同一个凭证只能一个人用」的落点 —— 凭证本身不再是一张可以复制
+    #: 传播的长期票据，而是一条绑定到具体会话行的记录。
+    SESSION_SINGLE = os.getenv("ADMIN_SESSION_SINGLE", "1") != "0"
+    #: 是否把会话绑定到设备标识 Cookie（`wb_device`）。
+    #:
+    #: 换浏览器/清 Cookie 后必须重新登录；把 `admin_session` 复制到另一台
+    #: 浏览器也过不了校验。CLI 走 `X-Admin-Token` 头时不做该绑定。
+    SESSION_BIND_DEVICE = os.getenv("ADMIN_SESSION_BIND_DEVICE", "1") != "0"
+    #: 设备标识 Cookie 有效期（天）。只用于绑定，不承载任何权限。
+    DEVICE_COOKIE_DAYS = int(os.getenv("ADMIN_DEVICE_COOKIE_DAYS", "180"))
+    #: 是否强制 CSRF 双提交校验（Cookie 鉴权的写操作）。
+    CSRF_ENABLED = os.getenv("ADMIN_CSRF_ENABLED", "1") != "0"
+
+    #: join 访问票据签名密钥。生产必须独立配置，**不要**复用 ADMIN_JWT_SECRET：
+    #: 两者生命周期不同（票据 15 分钟、会话 4 小时），共用一把钥匙意味着
+    #: 任一泄露点都会同时打穿两个体系。
+    #:
+    #: 留空时 `admin/join_gate.py` 会退回用 `JWT_SECRET` 派生 —— 这样未配置
+    #: 该变量的部署不会因为缺一把独立钥匙而完全不能用 join 功能。生产仍应
+    #: 显式配置（`admin/env_guard.py` 会提示）。
+    JOIN_TICKET_SECRET = os.getenv("JOIN_TICKET_SECRET", "")
+    #: join 访问票据 TTL（秒）。
+    #:
+    #: 2026-11-05 从 15 分钟放宽到 24 小时：票据不再是"一次性"，而是
+    #: **有效期内可重复打开**。15 分钟对"发给朋友、对方晚点再点"太苛刻，
+    #: 实际使用中只会逼着管理员反复签发。安全性由「总闸 + 代次 + 短码不可猜」
+    #: 保证：关闸或再开闸都会让旧链接全部失效。
+    JOIN_TICKET_TTL = max(60, min(7 * 86400, int(os.getenv("JOIN_TICKET_TTL", "86400"))))
+    #: 票据换来的访问 Cookie TTL（秒）。过期后重新点一次链接即可。
+    JOIN_ACCESS_TTL = max(60, min(24 * 3600, int(os.getenv("JOIN_ACCESS_TTL", "14400"))))
 
     # 服务监听。
     #
@@ -283,7 +333,9 @@ class Settings:
     #: Trae 的 `_timeout()` 直接读这个值去连上游，之前 180 < 300，
     #: 推理型模型思考到 200 秒就被上游读超时打断，而网关还以为是正常结束。
     #: 现在统一到 300，两边口径一致。
-    STREAM_IDLE_TIMEOUT = float(os.getenv("ADMIN_STREAM_IDLE_TIMEOUT", "300"))
+    # 600s：这是**帧间隔/静默**上限，不是请求总时长。深度思考模型静默
+    # 3~4 分钟属正常工作状态，不能被网关掐断（用户实测反馈）。
+    STREAM_IDLE_TIMEOUT = float(os.getenv("ADMIN_STREAM_IDLE_TIMEOUT", "600"))
     #: 写入（上传 prompt）超时（秒）。
     STREAM_WRITE_TIMEOUT = float(os.getenv("ADMIN_STREAM_WRITE_TIMEOUT", "60"))
     #: 连接池等待超时（秒）：池子饱和就快速失败，交给上层退避，而不是无限排队。
@@ -318,6 +370,24 @@ class Settings:
     #: 到底什么时候能恢复。现在硬失败按这个值的 4 倍冷却，并用
     #: BAN_RECHECK 做真实探测解封 —— 恢复时间对两类错误都可预期。
     ACCOUNT_FAULT_COOL_MINUTES = int(os.getenv("ADMIN_ACCOUNT_FAULT_COOL_MINUTES", "10"))
+
+    #: **11140（账号级授权风控）单独的冷却时长**，默认 2 小时。
+    #:
+    #: ## 为什么和 `ACCOUNT_FAULT_COOL_MINUTES` 分开（2026-11-06）
+    #:
+    #: 原来 11140 和其它 account_fault 一起吃 10 分钟冷却 —— 这个值对
+    #: 「临时限流」够用，对 11140 远远不够。社区两份实测复盘（workbuddy2api
+    #: hub `wb_accounts.py` / panel `pool/degrade.go`）都记录了同一件事：
+    #:
+    #:   > 看到 11140 就换号继续打同一台设备，设备指纹会连坐 ——
+    #:   > 一个请求能遍历整个池子，7 个号在一次任务里全被封。
+    #:
+    #: 11140 是**账号级授权风控**，不是限流。给 10 分钟，等于每 10 分钟就
+    #: 拿同一个号再去撞一次，撞一次加深一次。hub 的口径是固定 2 小时、
+    #: 不吃任何兜底、只有真成功一次才清。
+    #:
+    #: 设为 0 表示立刻回退到旧的「吃 ACCOUNT_FAULT_COOL_MINUTES」。
+    RESTRICTED_COOL_MINUTES = int(os.getenv("ADMIN_RESTRICTED_COOL_MINUTES", "120"))
 
     # ---- 风控预警通知 ----
     #:

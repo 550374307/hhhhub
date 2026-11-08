@@ -137,27 +137,33 @@ class WorkBuddyAccountOps:
         改走 `workbuddy.core.client_session.inject()`：它同时改 `.info` 与
         同目录的 `.observation.json` 旁证、原子写、写完读回来核对 uid，
         并在客户端运行时如实回报 `needs_restart`，而不是假装成功。
+
+        `payload` 必须是**客户端官方加密格式**的 `.info` 全文（由
+        `credential_codec.encrypt_credential` 产出），与
+        `/api/accounts/{id}/inject` 路由共用同一套口径。
         """
-        from admin.platform.workbuddy.core import client_session
         from admin.models import Account
+        from admin.platform.workbuddy.core import client_session
+        from admin.platform.workbuddy.core.credential_codec import (
+            encrypt_credential,
+            normalize_credential,
+        )
 
         acc = db.query(Account).filter(Account.id == account_id).first()
         if acc is None:
             raise ValueError("账号不存在: %s" % account_id)
-        from admin.credential_codec import normalize_credential
-
-        raw = normalize_credential(acc.auth_json)
+        payload = encrypt_credential(acc.auth_json)
         uid = str(acc.uid or "")
         if not uid:
             # 少数历史账号 uid 列为空，从凭证里补一次
             try:
                 import json as _json
 
-                payload = _json.loads(raw)
-                uid = str(((payload or {}).get("account") or {}).get("uid") or "")
+                data = _json.loads(normalize_credential(acc.auth_json))
+                uid = str(((data or {}).get("account") or {}).get("uid") or "")
             except Exception:  # noqa: BLE001 - 补不出来就按空 uid 继续
                 uid = ""
-        return client_session.inject(payload=raw, uid=uid, name=acc.name or "",
+        return client_session.inject(payload=payload, uid=uid, name=acc.name or "",
                                      restart=restart)
 
     def export(self, db, ids=None):

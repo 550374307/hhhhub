@@ -43,6 +43,27 @@ def _get_account(db, account_id):
     return account
 
 
+def _uid_selected(uid: str, wanted: list[str]) -> bool:
+    """勾选匹配：完整 uid 命中，或脱敏值（含 `*`）按前缀命中。
+
+    前端历史上传过脱敏 uid（`pu-01a1a******`），只做全等比较会导致
+    「明明勾了却提示不在范围内」。带 `*` 的串按 `*` 之前的前缀匹配，
+    既兼容旧前端，也不会误伤别的账号（uid 前缀足够长）。
+    """
+    uid = str(uid or "")
+    for item in wanted:
+        text = str(item or "").strip()
+        if not text:
+            continue
+        if text == uid:
+            return True
+        if "*" in text:
+            prefix = text.split("*", 1)[0]
+            if prefix and uid.startswith(prefix):
+                return True
+    return False
+
+
 class RaccoonAccountOps:
     """账号池的 11 项操作。"""
 
@@ -81,82 +102,49 @@ class RaccoonAccountOps:
         return {"items": views, "summary": raccoon_accounts.summarize(views)}
 
     def scan(self):
-        """本机扫描：读客户端明文的 auth.json。
+        """本机扫描（**已支持**）。
 
-        ## 为什么之前写着「不支持」
-
-        旧实现的结论是「小浣熊登录态存在 Electron LevelDB 中，不是明文文件，
-        无法直接扫描」。那是**误判** —— 逆向客户端主进程
-        `build/electron/main/agent/boxAgentAuthFile.js` 可见：
-
-            authPath = BOX_AGENT_CONFIG_DIR
-                       or resolveBoxAgentHome(homedir)/config/auth.json
-
-        客户端启动时把 `BOX_AGENT_HOME` 指到自己的 profile 目录，实测是
-        `<user>/.office-raccoon/agent/config/auth.json`，内容是**明文 JSON**。
-        也就是说凭证根本不在 LevelDB 里。
-
-        现在直接读它（`scan.discover()` 只回脱敏 uid，不含 token）。
+        逆向 `@raccoonoffice-desktop`（build/electron/main/agent/
+        boxAgentAuthFile.js）确认：客户端登录态是**明文 auth.json**
+        （`BOX_AGENT_CONFIG_DIR` 或 `~/.office-raccoon/agent/config/auth.json`，
+        IAM JWT + office_identity）。PR #9 时代的 LevelDB 结论不成立。
         """
         from admin.platform.raccoon.services import scan as raccoon_scan
 
-        try:
-            found = raccoon_scan.discover()
-        except Exception as exc:  # noqa: BLE001 - 扫描失败不该 500
-            _logger.warning("小浣熊本机扫描失败: %s", exc)
-            return {
-                "supported": True,
-                "items": [],
-                "data_dirs": [],
-                "reason": "scan_error",
-                "hint": "扫描失败：%s。可直接用「导入凭证」粘贴明文 JSON 或裸 JWT。" % exc,
-            }
-        found["supported"] = True
-        return found
+        return raccoon_scan.discover()
 
-    def import_local(self, db, uids=None):
-        """把扫描到的本机凭证入库。
+    def import_local(self, db, uids: list[str] | None = None):
+        """本机导入：读取客户端 auth.json 入库（uid 过滤口径同 loomy）。
 
-        `uids` 是前端勾选的 uid（脱敏值或完整值都认）；为空表示全部导入。
+        uids 是前端「扫描 → 勾选 → 确认」里用户选中的 uid；None = 全部。
 
-        注意 `scan.discover()` **不含 token**（它是给界面展示用的），
-        真正入库要调 `scan.read_credentials()` —— 后者返回
-        `normalize_record` 可直接消费的形状。
+        ⚠️ 允许**脱敏 uid**：扫描结果里展示的是 `pu-01a1a******`（脱敏），
+        旧版前端会把展示值当 uid 传回来。带 `*` 的值按前缀匹配处理，
+        否则整批会被判成「不在勾选范围内」——用户看到的就是
+        「扫描到凭证了，点导入却说没有导入任何账号」（2026-11-04 复现）。
         """
         from admin.platform.raccoon.services import scan as raccoon_scan
 
+        creds = raccoon_scan.read_credentials()
+        if not creds:
+            return {"supported": True, "imported": 0, "reason": "no_local_credential",
+                    "hint": "没找到客户端登录态（~/.office-raccoon/agent/config/auth.json）。"
+                            "请先在客户端登录，或改用「授权登录」扫码入库。"}
+        if uids is not None:
+            wanted = [str(u or "").strip() for u in uids]
+            wanted = [w for w in wanted if w]
+            if wanted and creds.get("uid") and not _uid_selected(creds["uid"], wanted):
+                return {"supported": True, "imported": 0, "reason": "not_selected",
+                        "hint": "本机凭证不在勾选范围内，未导入"}
+        record = {"token": creds["token"], "uid": creds.get("uid") or "",
+                  "expiresAt": creds.get("expiresAt"), "source": "scan-local"}
         try:
-            found = raccoon_scan.discover()
-        except Exception as exc:  # noqa: BLE001
-            return {"supported": True, "imported": 0, "reason": "scan_error",
-                    "hint": "扫描失败：%s" % exc}
-
-        wanted = {str(u).strip().lower() for u in (uids or []) if str(u).strip()}
-        if wanted:
-            hit = [it for it in (found.get("items") or [])
-                   if isinstance(it, dict)
-                   and (str(it.get("uid") or "").lower() in wanted
-                        or str(it.get("uid_full") or "").lower() in wanted)]
-            if not hit:
-                return {
-                    "supported": True, "imported": 0, "reason": "not_selected",
-                    "hint": "勾选的账号不在本次扫描结果里，请重新扫描。",
-                }
-
-        cred = raccoon_scan.read_credentials()
-        if not cred:
-            return {
-                "supported": True, "imported": 0, "reason": "no_local_credentials",
-                "hint": found.get("hint") or "未发现本机小浣熊登录态，请先在客户端登录。",
-            }
-        try:
-            result = raccoon_accounts.import_many(db, [cred])
-        except Exception as exc:  # noqa: BLE001 - 单条导入失败要说清原因
-            _logger.warning("小浣熊本机导入失败: %s", exc)
-            return {"supported": True, "imported": 0, "reason": "import_error",
-                    "hint": "导入失败：%s" % exc}
-        result.update({"supported": True, "reason": ""})
-        return result
+            raccoon_accounts.import_record(db, record)
+            db.commit()
+        except ValueError as exc:
+            return {"supported": True, "imported": 0,
+                    "reason": "invalid_credential", "hint": str(exc)}
+        return {"supported": True, "imported": 1}
 
     def import_record(self, db, record):
         """导入单条。返回 `(账号, 是否新建)`（契约要求）。"""
@@ -346,8 +334,8 @@ class RaccoonClientProbe:
             "note": "凭证不依赖本机客户端；此处仅报告是否安装",
         }
         return enrich(result,
-                      exe_candidates=_paths.APP_EXE_CANDIDATES,
-                      data_dirs=_paths.DATA_DIR_CANDIDATES,
+                      exe_candidates=_paths.app_exe_candidates(),
+                      data_dirs=_paths.data_dir_candidates(),
                       product=_paths.UA_PRODUCT)
 
     def schema(self) -> list[dict]:
@@ -404,6 +392,25 @@ class RaccoonGateway:
     def account_ops(self) -> AccountOps:
         return RaccoonAccountOps(self.realm)
 
+    # ---- 凭证有效期 ----
+    def credential_expiry(self, auth_json) -> dict:
+        """小浣熊的 token 到期 + 能否刷新（有 refresh_token 就能一直续）。"""
+        from admin.platform import shared
+
+        data = shared.parse_auth_json(auth_json)
+        if not data:
+            return shared.credential_window()
+        expires = shared.seconds_from(data.get("expires_at") or data.get("expiresAt"))
+        has_refresh = bool(data.get("refresh_token") or data.get("refreshToken"))
+        refresh_expires = shared.seconds_from(
+            data.get("refresh_expires_at") or data.get("refreshExpiresAt")) or expires
+        return shared.credential_window(
+            expires_at=expires, refresh_expires_at=refresh_expires or None,
+            has_refresh=has_refresh)
+
+    def renewal_guard_days(self) -> int:
+        return 7
+
     def task_runners(self) -> dict:
         from admin.platform.raccoon import _task_runners as declared
         from admin.platform.raccoon.services import tasks
@@ -440,7 +447,7 @@ class RaccoonGateway:
             {"key": "models", "label": "可用模型", "value": models,
              "sub": "来自上游 /model_catalog", "icon": "fa-cube", "tone": ""},
             {"key": "mode", "label": "接入方式", "value": "Bearer JWT",
-             "sub": "凭证导入（无本机扫描）", "icon": "fa-key", "tone": ""},
+             "sub": "本机扫描 / 文件导入 / 扫码授权", "icon": "fa-key", "tone": ""},
         ]
 
 

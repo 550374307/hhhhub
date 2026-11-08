@@ -4,6 +4,7 @@
 用该账号凭据转发到后端 → 流式返回 → 按用量回扣 Key 额度。
 """
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -164,6 +165,8 @@ def _normalize_harness_body(chat_body: dict) -> dict:
             _logger.info("[harness-compat] 固定模板归一 %d 处", stats["templates"])
         if stats.get("shield"):
             _logger.info("[harness-compat] harness 提示词改写 %d 段（shield）", stats["shield"])
+        if stats.get("billing"):
+            _logger.info("[fingerprint] 计费指纹行整行删除 %d 条", stats["billing"])
         if stats.get("orphans"):
             _logger.warning("[harness-compat] 清理孤儿 tool_call %d 处 | diag=%s",
                             stats["orphans"], _tool_diag(chat_body))
@@ -204,16 +207,15 @@ def _tool_diag(chat_body: dict) -> str:
 
 
 def _strip_channel_fingerprints(chat_body: dict) -> int:
-    """删掉客户端渠道指纹，与 converter /gw 的 `prepare_upstream_body` 同款。
+    """删掉客户端指纹，与 converter /gw 的 `prepare_upstream_body(sanitize=True)` 同款。
 
-    **顺序是语义**：必须先把 `x-anthropic-billing-header` 整行删掉，**再**做
-    零宽空格脱敏。脱敏会在词内部插 U+200B，`_HDR_RE` 之后就再也匹配不到这个
-    头；而上游会归一化零宽字符，于是「看起来改过了，字面仍然成立」——
-    这正是 400/11128 长期稳定在 4~6% 的成因
-    （实测：AUX 带 billHdr 88.4% 被拒，不带 4.3%）。
+    **顺序是语义**：必须先整行删 `x-anthropic-billing-hdr`，再做零宽空格脱敏。
+    脱敏会在词内部插 U+200B，`_HDR_RE` 之后就再也匹配不到这个头；而上游会
+    归一化零宽字符，于是「看起来改过了，字面仍然成立」—— 这正是 400/11-128
+    长期稳定在 4~6% 的成因（实测：AUX 带 billHdr 88.4% 被拒，不带 4.3%）。
 
-    这一步**不受 `ANTHROPIC_DESENSITIZE` 开关约束**：指纹是渠道校验，
-    不是内容审核，关掉脱敏不该让指纹漏出去。
+    这一步**不受 `ANTHROPIC_DESENSITIZE` 开关约束**：指纹是渠道校验，不是内容审核。
+    关掉脱敏不该让渠道指纹漏出去 —— 上游按它判定「非官方客户端」（11-128）。
     """
     try:
         n = strip_harness_billing_header(chat_body)
@@ -238,7 +240,12 @@ def _strip_channel_fingerprints(chat_body: dict) -> int:
 
 
 def _drop_emptied_system_messages(chat_body: dict) -> int:
-    """摘掉被净化成空壳的 system/developer 消息，返回摘掉的条数。"""
+    """摘掉被净化成空壳的 system/developer 消息，返回摘掉的条数。
+
+    指纹整行删掉后，system 消息可能只剩空串；空 content 的 system 消息
+    一部分上游直接 400，所以整条摘掉。只摘 system/developer ——
+    user/assistant 的空消息是合法的「本轮无正文」。
+    """
     msgs = chat_body.get("messages")
     if not isinstance(msgs, list):
         return 0
@@ -259,6 +266,7 @@ def _drop_emptied_system_messages(chat_body: dict) -> int:
     return dropped
 
 
+
 def _desensitize_chat_body(chat_body: dict) -> dict:
     """harness 脱敏（CC / OpenAI 反代 / converter /gw 共用同一套）。
 
@@ -269,6 +277,7 @@ def _desensitize_chat_body(chat_body: dict) -> dict:
 
     指纹净化在开关判断**之前**无条件执行，见 `_strip_channel_fingerprints`。
     """
+    # 指纹净化无条件执行且必须早于脱敏；三条 /v1/* 链路都从这里过。
     removed = _strip_channel_fingerprints(chat_body)
     if removed:
         _logger.info("[fingerprint] 客户端指纹净化 %d 处", removed)
@@ -359,11 +368,33 @@ def _session_headers(body: dict, uid: str) -> dict:
     return h
 
 
+def upstream_conversation_id(body: dict) -> str:
+    """本次 upstream 调用声明的「会话」。
+
+    优先用客户端显式给的会话标识（原样转发 —— 那是它自己的对话 id）；
+    没有时用**首条 user 消息**派生一个 32 位十六海的稳定值，而不是留空。
+
+    留空的后果不是"没有会话"，而是 `trace_headers` 每请求现造一个 UUID：
+    上游眼里每次请求都是全新对话，前缀缓存永远打不中，一个号一分钟内
+    能"新建"几十个会话 —— 这既是缓存浪费，也是风控最敏感的形状。
+    """
+    body = body if isinstance(body, dict) else {}
+    explicit = pool.extract_session_key(body)
+    if explicit:
+        return explicit
+    derived = pool.session_key_for(body)
+    if not derived:
+        return ""
+    return hashlib.sha256(("workbuddy|" + derived).encode("utf-8")).hexdigest()[:32]
+
+
 def _turn_headers(body: dict, purpose: str) -> tuple[str, str]:
     """Resolve (conversation, turn) once per gateway request.
 
-    The conversation id comes from the caller when it supplied one; the turn id
-    is stable for every attempt that belongs to this gateway request, so a
+    The conversation id comes from the caller when it supplied one; otherwise
+    ``upstream_conversation_id`` derives a stable one (see its docstring — the
+    empty case used to randomise the conversation on every request). The turn
+    id is stable for every attempt that belongs to this gateway request, so a
     rotated/retried request still reads as one turn upstream. ``purpose`` is
     accepted so endpoints can state their use case at the same place.
 
@@ -373,30 +404,20 @@ def _turn_headers(body: dict, purpose: str) -> tuple[str, str]:
     instead of being pinned to the turn.
     """
     del purpose
-    conversation = pool.extract_session_key(body) if isinstance(body, dict) else ""
+    conversation = upstream_conversation_id(body)
     return conversation, identity.turn_id(body if isinstance(body, dict) else None)
 
 
 
 def _reasoning_effort(payload: dict) -> str:
-    """Keep only a bounded request setting, never prompts or arbitrary payloads."""
-    effort = payload.get("reasoning_effort") or payload.get("reasoningEffort")
-    reasoning = payload.get("reasoning")
-    if not effort:
-        effort = reasoning.get("effort") if isinstance(reasoning, dict) else reasoning
-    allowed = {"off", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra", "auto"}
-    if isinstance(effort, str) and effort.strip().lower() in allowed:
-        return effort.strip().lower()
-    thinking = payload.get("thinking")
-    if isinstance(thinking, dict):
-        if thinking.get("type") == "disabled":
-            return "off"
-        budget = thinking.get("budget_tokens")
-        if isinstance(budget, int) and not isinstance(budget, bool) and 0 <= budget <= 10**9:
-            return f"budget:{budget}"
-        if thinking.get("type") in ("enabled", "adaptive"):
-            return thinking["type"]
-    return ""
+    """Keep only a bounded request setting, never prompts or arbitrary payloads.
+
+    实现已收敛到 `admin.platform.shared.reasoning_effort_of` —— 各平台网关记账时
+    也要记同一个口径，不能各写一份（否则日志里同一个请求会有两种值）。
+    """
+    from admin.platform.shared import reasoning_effort_of
+
+    return reasoning_effort_of(payload)
 
 
 def _record_usage(key_id: int, account_id: int, model: str, credits: float | None,
@@ -1345,7 +1366,10 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
         cool_hint = ""
         if kind == "account_fault":
             base = max(1, settings.ACCOUNT_FAULT_COOL_MINUTES)
-            cool_hint = " · 冷却 %d 分钟" % (base if code == "11140" else base * 4)
+            # 11140 单独口径（默认 2 小时），提示里要报它真实生效的时长
+            minutes_hint = ((settings.RESTRICTED_COOL_MINUTES or base)
+                            if code == "11140" else base * 4)
+            cool_hint = " · 冷却 %d 分钟" % minutes_hint
         elif kind == "session_dead":
             cool_hint = " · 登录态需重新授权"
         elif code == "11128":
@@ -1453,7 +1477,13 @@ def _apply_account_policy(db: Session, acc: Account, kind: str, status: int,
         # 这正是「账号冷却没有准信」的成因。
         code = _json_code(msg)
         if code == "11140":
-            minutes = max(1, settings.ACCOUNT_FAULT_COOL_MINUTES)
+            # 11140 是**账号级授权风控**，不是限流。给 10 分钟等于每 10 分钟
+            # 拿同一个号再撞一次，撞一次加深一次 —— 而且期间还会换号继续打
+            # 同一台设备，设备指纹连坐（社区复盘的结论，见
+            # `config.RESTRICTED_COOL_MINUTES` 的注释）。
+            # 默认 2 小时；配 0 回退旧行为。
+            minutes = settings.RESTRICTED_COOL_MINUTES or max(
+                1, settings.ACCOUNT_FAULT_COOL_MINUTES)
         else:
             # 硬失败：给更长的冷却，避免反复用同一个号去打上游
             minutes = max(1, settings.ACCOUNT_FAULT_COOL_MINUTES * 4)

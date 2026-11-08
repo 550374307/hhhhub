@@ -2,15 +2,18 @@
 
     GET  /api/raccoon/meta             平台元信息
     GET  /api/raccoon/accounts         账号列表（按平台隔离）
-    POST /api/raccoon/import           导入（单条 / 批量）
-    GET  /api/raccoon/export           导出成 agent2api 兼容格式
+    POST /api/raccoon/import           导入（单条 / 批量 / 整段粘贴）
+    POST /api/raccoon/scan-local       扫描本机（~/.office-raccoon/.../auth.json）
+    POST /api/raccoon/import-local     本机凭证入库（扫描 → 勾选 → 确认）
+    GET  /api/raccoon/export           导出成 agent2api 兼容格式（备份 / 脱敏）
     POST /api/raccoon/accounts/{id}/refresh   探活并刷新
     POST /api/raccoon/accounts/{id}/test      分段连通性检查
     GET  /api/raccoon/credits          积分总览
     GET  /api/raccoon/usage            用量（本网关账本）
 
-注意：**没有 scan-local / import-local** —— 小浣熊的登录态在 Electron
-LevelDB 里，不是明文文件，扫不出来。硬加一个只会让人以为客户端没登录。
+说明：小浣熊的登录态是**明文** auth.json（逆向 `boxAgentAuthFile.js` 确认），
+所以 scan-local / import-local 是真的能用的 —— PR #9 时代的 LevelDB
+结论早已作废，别照着那句旧注释把这两个接口删掉。
 """
 from __future__ import annotations
 
@@ -84,11 +87,13 @@ def meta(_: bool = Depends(require_admin)):
         "auth": "Bearer JWT（HS256，iss=xiaohuanxiong.com/iam）",
         "quota_kind": "balance",
         "note": "积分制；有 refresh 接口但 refreshToken 与 accessToken 同值",
-        "auth_mode": "import-only",
+        "auth_mode": "device-auth",
         "auth_explain": (
-            "小浣熊客户端用 Electron LevelDB 保存登录态（非明文），"
-            "且不是每台机器都安装。凭证请通过导入添加："
-            "支持 agent2api 导出的 agent2api-account JSON、裸 JWT、或原生对象。"
+            "三种入库方式：①「扫描本机」读取客户端登录态"
+            "（~/.office-raccoon/agent/config/auth.json，明文 IAM JWT）；"
+            "②「导入文件」选本地 JSON / JSONL / TXT（agent2api 备份、裸 JWT 都吃，"
+            "自动识别 UTF-8 / GBK）；③「授权登录」扫码免客户端入库——"
+            "官方小程序扫码，手机确认，无需滑块与短信验证码。"
         ),
     }
 
@@ -263,59 +268,33 @@ def usage(realm: str = "", days: int = 30, _: bool = Depends(require_admin),
 
 @router.get("/scan-local")
 def scan_local(_: bool = Depends(require_admin)):
-    """扫描本机客户端登录态。
-
-    凭证是**明文** `auth.json`（`BOX_AGENT_CONFIG_DIR` 或
-    `~/.office-raccoon/agent/config/`），不是 Electron LevelDB ——
-    旧注释里那个结论已被 `services/scan.py` 的逆向证据推翻。
-    """
+    """扫描本机客户端登录态（auth.json，逆向 boxAgentAuthFile.js 确认）。"""
     from admin.platform.raccoon.platform_gateway import RaccoonAccountOps
 
     return RaccoonAccountOps("").scan()
 
 
 class ImportLocalIn(BaseModel):
-    """本机导入：`uids` 为空表示全部导入。"""
     uids: list[str] | None = None
+
+
+class AuthCancelIn(BaseModel):
+    auth_id: str = ""
 
 
 @router.post("/import-local")
 def import_local(body: ImportLocalIn | None = None,
-                 _: bool = Depends(require_admin),
-                 db: Session = Depends(get_db)):
-    """把扫描到的本机凭证入库（扫描 → 勾选 → 确认）。"""
+                 _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """本机凭证入库（前端「扫描 → 勾选 → 确认」两步）。"""
     from admin.platform.raccoon.platform_gateway import RaccoonAccountOps
 
-    uids = (body.uids if body is not None else None) or []
-    return RaccoonAccountOps("").import_local(db, uids=uids)
-
-
-@router.post("/checkin")
-def checkin(realm: str = "", _: bool = Depends(require_admin)):
-    """小浣熊没有签到接口 —— 返回 `supported: False`（不是错误）。"""
-    return {"supported": False,
-            "summary": "小浣熊没有签到接口；额度按积分计量"}
+    return RaccoonAccountOps("").import_local(
+        db, uids=body.uids if body else None)
 
 
 # ---------------------------------------------------------------------------
-# 扫码授权（免客户端 / 免滑块 / 免短信）
+# 扫码授权（免客户端）：官方 IAM 小程序扫码登录，成功即入库
 # ---------------------------------------------------------------------------
-# 协议（逆向客户端 + 实测）：
-#   POST /api/iam/v1/auth/mp/qrcode          {}                      -> {qrcode_code, expires_in, poll_interval}
-#   POST /api/iam/v1/auth/mp/qrcode/login    {qrcode_code}           -> pending|logging|canceled|success(+access_token)
-#   PUT  /api/iam/v1/auth/mp/qrcode          {qrcode_code, status}   -> 撤销
-#   二维码内容  https://xiaohuanxiong.com/login/mp?code=<code>&appname=…&source=platform
-#
-# ⚠️ **重要前提**：实测扫码拿到的 IAM 会话对业务接口一律返回
-# `200901 iam_confirm_required`（目录/积分/权益全一样），而客户端 auth.json
-# 里那张票是好的。所以 `webauth.poll()` 在入库前会先用最便宜的目录接口探一次，
-# 不通就不落库、把原因回给前端 —— 否则会出现「授权成功了却什么都用不了」，
-# 更糟的是把本来能用的凭证覆盖成不能用的。
-#
-# 结论：扫码是一条**备用入口**，成功率取决于上游当时是否放行；
-# 首选仍然是「扫描本机」（客户端已登录时凭证是好的）。
-
-
 @router.post("/auth/begin")
 def auth_begin(_: bool = Depends(require_admin)):
     """创建扫码会话：返回 auth_id + 二维码内容（前端渲染二维码）。"""
@@ -330,7 +309,7 @@ def auth_begin(_: bool = Depends(require_admin)):
 @router.get("/auth/poll")
 def auth_poll(auth_id: str = "", _: bool = Depends(require_admin),
               db: Session = Depends(get_db)):
-    """轮询扫码状态；`success` 时**已校验并入库**。"""
+    """轮询扫码状态；success 时已入库。"""
     from admin.platform.raccoon.services import webauth
 
     if not auth_id.strip():
@@ -340,34 +319,29 @@ def auth_poll(auth_id: str = "", _: bool = Depends(require_admin),
 
 @router.get("/auth/qr.svg")
 def auth_qr_svg(auth_id: str = "", _: bool = Depends(require_admin)):
-    """二维码 SVG（前端直接内嵌；不落盘、不进日志）。
-
-    注意 `webauth.qr_svg()` 收的是**二维码内容**（`qr_value`），不是 `auth_id`；
-    这里从会话里取出 `qr_value` 再渲染，避免把长 URL 暴露成前端参数
-    （也避免用户拿别人的 qr_value 来请求）。
-    """
-    from fastapi.responses import Response
-
+    """二维码 SVG（后端渲染，控制台 CSP 只放行同源资源）。"""
     from admin.platform.raccoon.services import webauth
 
-    if not auth_id.strip():
-        raise HTTPException(400, detail="缺少 auth_id")
-    sess = webauth._sessions.get(auth_id.strip())  # noqa: SLF001 - 同模块内部状态
-    if not sess:
-        raise HTTPException(404, detail="会话不存在或已过期")
-    try:
-        svg = webauth.qr_svg(str(sess.get("qr_value") or ""))
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(500, detail="二维码生成失败：%s" % exc) from exc
-    return Response(content=svg, media_type="image/svg+xml",
+    with webauth._lock:
+        sess = webauth._sessions.get(auth_id.strip())
+    if sess is None:
+        raise HTTPException(404, detail="授权会话不存在或已过期")
+    from fastapi.responses import Response
+
+    svg = webauth.qr_svg(sess["qr_value"])
+    return Response(svg, media_type="image/svg+xml",
                     headers={"Cache-Control": "no-store"})
 
 
 @router.post("/auth/cancel")
-def auth_cancel(auth_id: str = "", _: bool = Depends(require_admin)):
-    """撤销扫码会话（用户关掉弹窗时调用）。"""
+def auth_cancel(body: AuthCancelIn, _: bool = Depends(require_admin)):
     from admin.platform.raccoon.services import webauth
 
-    if not auth_id.strip():
-        raise HTTPException(400, detail="缺少 auth_id")
-    return webauth.cancel(auth_id.strip())
+    return webauth.cancel(body.auth_id)
+
+
+@router.get("/checkin")
+def checkin(realm: str = "", _: bool = Depends(require_admin)):
+    """小浣熊没有签到接口 —— 返回 `supported: False`（不是错误）。"""
+    return {"supported": False,
+            "summary": "小浣熊没有签到接口；额度按积分计量"}

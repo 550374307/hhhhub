@@ -24,14 +24,15 @@ Loomy 上游只有非流式接口。`stream: true` 时把完整结果**合成为
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 
-from starlette.background import BackgroundTask
 from starlette.responses import JSONResponse, StreamingResponse
 
 from admin.platform import shared
+from admin.platform import protocol_bridge as bridge
 from admin.platform.loomy.core import client
 from admin.platform.loomy.services import accounts as loomy_accounts
 
@@ -102,13 +103,11 @@ def _fail(exc: client.UpstreamError) -> JSONResponse:
         status_code=status)
 
 
-#: 上游只认这三个角色。别的角色进来后**不能原样透传**。
 #: 上游（OpenAI 兼容 /chat/completions）接受的角色。
-#:
-#: 2026-11-05 修正：官方客户端打同一上游端点的 498 条真实请求体里，
-#: `tool` 消息（175 条）与 assistant `tool_calls`（122 条）**原样透传，
-#: 490/490 全部 200** —— 之前「上游只认三种角色」的判断是错的，
-#: 把 tool 转成 user 文本反而导致工具调用不生效。
+#: 2026-11-05 修正：官方 3065 客户端（agentApi）打同一上游端点的 498 条
+#: 真实请求体里，`tool` 消息（175 条）与 assistant `tool_calls`（122 条）
+#: **原样透传，490/490 全部 200** —— 之前「上游只认三种角色」的判断是错的，
+#: 把 tool 转成 user 文本反而导致 call 工具调用不生效。
 _UPSTREAM_ROLES = frozenset({"system", "user", "assistant", "tool"})
 
 
@@ -121,11 +120,11 @@ def normalize_messages(raw) -> list[dict]:
     会用它承载系统提示（还把整段 system prompt 塞进去），上游不认，
     需要归一成 `system`。
 
-    ## 归一规则（改为**结构化透传**）
+    ## 归一规则（2026-11-05 起改为**结构化透传**）
 
     * `developer` -> `system`（它本来就是系统提示的语义）
     * `tool` -> **原样保留**（含 `tool_call_id` / `name`），上游实测接受；
-      老式 `function` 角色没有 call id 结构，归一到 `tool` 并保留凭据
+      老式 `function` 角色没有 call id 结构，降级为 user 文本
     * assistant 的 `tool_calls` -> **原样保留**（不再压成 JSON 文本块）。
       之前转文本的后果：模型把上一轮调用读成「一段描述」，
       参数经常缺引号/少括号，客户端解析失败直接中断
@@ -145,8 +144,8 @@ def normalize_messages(raw) -> list[dict]:
         if role == "developer":
             role = "system"
         elif role == "function":
-            # 老式 function 角色语义等同工具结果。上游实测接受 role=tool，
-            # 所以归一到 tool 并保留调用标识，不再降级成 user 文本
+            # 老式 function 角色语义等同工具结果。PR #18 实测上游接受
+            # role=tool，所以归一到 tool 并保留调用标识，不再降级成 user 文本
             # （降级会让模型把结果当成又一条用户消息，重复发起同一调用）。
             role = "tool"
         if role not in _UPSTREAM_ROLES:
@@ -169,8 +168,8 @@ def normalize_messages(raw) -> list[dict]:
             continue
         message = {"role": role, "content": content}
         if role == "tool":
-            # 工具结果**原样透传**（含调用标识）：丢掉 tool_call_id 的话
-            # 模型不知道结果对应哪次调用，会重复调用。
+            # 工具结果**原样透传**（含调用标识）：上游实测接受 role=tool。
+            # 丢掉 tool_call_id 的话模型不知道结果对应哪次调用，会重复调用。
             _tcid = item.get("tool_call_id")
             if _tcid:
                 message["tool_call_id"] = str(_tcid)
@@ -179,9 +178,10 @@ def normalize_messages(raw) -> list[dict]:
                 message["tool_call_id"] = str(item["name"])
             if item.get("name"):
                 message["name"] = str(item["name"])
-        if role == "assistant" and _has_calls:
+        if role == "assistant" and isinstance(item.get("tool_calls"), list):
             # assistant 的工具调用**原样保留**（不再压成 JSON 文本块）：
-            # 转文本会让模型把调用读成「一段描述」，参数经常缺引号/少括号。
+            # 官方 3065 客户端就是结构化透传，实测上游全部 200。转文本会让
+            # 模型把调用读成「一段描述」，参数经常缺引号/少括号。
             # 唯一例外：协议要求 arguments 是字符串；客户端传对象时序列化回去。
             calls = []
             for call in item["tool_calls"]:
@@ -201,18 +201,61 @@ def normalize_messages(raw) -> list[dict]:
             others.append(message)
     return systems + others
 
-def _apply_no_think(body: dict) -> dict:
-    """关掉推理链的三层保险（对非 reasoning 模型是 noop）。
 
-    上游 reasoning 模型会**无视 max_tokens 跑满思考链**，
-    导致 `finish_reason: length` 且 `content: ""` —— 看起来像「空回复」，
-    其实是正文还没开始就被截断了。
+def _thinking_requested(body: dict) -> str:
+    """下游是否**明确要**思考；要的话返回档位（空串表示没要）。
+
+    以前这里是无条件 `enable_thinking=False` —— 后果是用户把
+    `reasoning_effort` 设成 high/xhigh/max 也照样被网关按死，面板上看
+    「档位没生效」，其实是网关把请求改写成了「不要思考」。
+
+    规则和 `shared.reasoning_effort_of` 对齐：`off/none/minimal` 视为不要，
+    其余档位（含 Anthropic 的 `thinking.budget_tokens`）视为要。
+    """
+    from admin.platform.shared import reasoning_effort_of
+
+    effort = reasoning_effort_of(body)
+    if not effort:
+        return ""
+    if effort in ("off", "none", "minimal"):
+        return ""
+    return effort
+
+
+def _apply_no_think(body: dict) -> dict:
+    """按下游意图决定「要不要思考」，并给够输出预算。
+
+    默认（下游没说要思考）关掉推理链 —— 上游 reasoning 模型会**无视
+    max_tokens 跑满思考链**，导致 `finish_reason: length` 且 `content: ""`，
+    看起来像「空回复」，其实是正文还没开始就被截断。
+
+    但**下游明确要了档位**（`reasoning_effort` = low/medium/high/xhigh/max）
+    时必须尊重：打开 `enable_thinking` 并把档位原样带给上游。否则这个参数
+    在 Loomy 上就是个摆设 —— 客户端以为调高了推理强度，实际被网关抹平。
     """
     out = dict(body)
+    requested = _thinking_requested(body)
     params = dict(out.get("chat_template_kwargs") or {})
-    params.setdefault("enable_thinking", False)
+    if requested:
+        params["enable_thinking"] = True
+        out["enable_thinking"] = True
+        # 上游认的是 OpenAI 的 `reasoning_effort`；档位名原样带过去，
+        # 不支持的档位由上游决定「忽略」还是「报错」，网关不擅自降级。
+        if requested.isdigit() or ":" in requested:
+            # `budget:8192` / `adaptive` 这类不是上游枚举值：转成等价档位
+            try:
+                budget = int(requested.split(":", 1)[1])
+            except (IndexError, ValueError):
+                budget = 0
+            if budget:
+                out["reasoning_effort"] = ("low" if budget <= 2048 else
+                                           "medium" if budget <= 8192 else "high")
+        else:
+            out["reasoning_effort"] = requested
+    else:
+        params.setdefault("enable_thinking", False)
+        out.setdefault("enable_thinking", False)
     out["chat_template_kwargs"] = params
-    out.setdefault("enable_thinking", False)
 
     # **`max_tokens` 必须放大**。
     #
@@ -267,29 +310,49 @@ def _apply_no_think(body: dict) -> dict:
         out["max_tokens"] = 32768
 
     # `/no_think` 前缀对 Loomy **无效**（实测它会把这三个字当正文念出来），
-    # 所以这里不再拼接，避免污染用户输入。
-    messages = normalize_messages(out.get("messages") or [])
-    for index in range(len(messages) - 1, -1, -1):
-        item = messages[index]
-        if not isinstance(item, dict) or item.get("role") != "user":
-            continue
-        content = item.get("content")
-        if isinstance(content, str) and not content.lstrip().startswith("/no_think"):
-            messages[index] = {**item, "content": "/no_think " + content}
-        break
-    out["messages"] = messages
+    # 所以只在**确实要关思考**时才拼；用户明确要思考时拼上去等于往 prompt
+    # 里塞垃圾，既污染输入，也白白拉低缓存命中。
+    if not requested:
+        messages = normalize_messages(out.get("messages") or [])
+        # ⚠️ 归一后为空时**不要回写**。
+        # normalize_messages 会丢弃无法识别的角色；全被丢光还回写，
+        # 就是把空数组发给上游 -> `400 messages 不能为空`（PR #18 定位的
+        # 第二个来源）。保留原始 messages，让上游看到真实输入、报错更准确。
+        if messages:
+            for index in range(len(messages) - 1, -1, -1):
+                item = messages[index]
+                if not isinstance(item, dict) or item.get("role") != "user":
+                    continue
+                content = item.get("content")
+                # 只给真正的用户文本加前缀：空串跳过，避免生成
+                # "/no_think " 这种只有前缀没有内容的消息。
+                if (isinstance(content, str) and content.strip()
+                        and not content.lstrip().startswith("/no_think")):
+                    messages[index] = {**item, "content": "/no_think " + content}
+                break
+            out["messages"] = messages
     return out
 
 
 def _attempt(db, request, key, body: dict, realm: str):
-    """选号 + 租约 + 调上游（换号重试）。"""
+    """选号 + 租约 + 调上游（换号重试）。
+
+    **必须在工作线程里执行**（见 `_forward`）：本函数从头到尾是同步的
+    —— SQLAlchemy 同步会话 + `client.chat_completions` 里的 `urlopen`。
+    直接跑在事件循环线程上时，一次上游卡顿会把整个单进程服务冻住
+    （2026-11-05 线上「导入账号卡死」就是这么来的：`DEFAULT_TIMEOUT`
+    是 600 秒，期间所有请求、控制台、同步接口全部无响应）。
+    """
     model = str(body.get("model") or "")
     exclude: set[int] = set()
     last_error: client.UpstreamError | None = None
     for _ in range(MAX_ATTEMPTS):
         account = shared.select_account(
             db, storage=loomy_accounts.PLATFORM, realm=realm, key=key,
-            model=model, exclude_ids=exclude)
+            model=model, exclude_ids=exclude,
+            # 余额为 0 的号调用必被上游 402 打回：直接不进候选，
+            # 而不是先撞一次再冷却（见 shared.select_account 的说明）。
+            min_balance=0)
         if account is None:
             break
         if not shared.lease(account):
@@ -301,20 +364,34 @@ def _attempt(db, request, key, body: dict, realm: str):
             result = client.chat_completions(
                 loomy_accounts.token_of(data), realm, _apply_no_think(body),
                 account_id=int(account.id or 0))
-            return result, account, started
+            # **contextvar 只在设置它的线程上下文里可见**。这段跑在工作线程，
+            # 事件循环那边的 `_bill` 读不到，必须在这里取出来随结果带回去。
+            stats = {
+                "ttfb_ms": int(client.LAST_TTFB_MS.get() or 0),
+                "total_ms": int(client.LAST_TOTAL_MS.get() or 0),
+            }
+            return result, account, started, stats
         except client.UpstreamError as exc:
             shared.release(account)
             shared.note_failure(
                 db, account, kind=exc.kind, detail=exc.detail or exc.message,
                 status=exc.status, model=model, public_platform=PUBLIC,
-                cool_seconds=(600 if exc.kind in ("auth", "quota_exceeded") else 0))
+                cool_seconds=(600 if exc.kind in ("auth", "quota_exceeded") else 0),
+                # 额度类失败把余额落成 0，从选号候选里摘掉 ——
+                # 否则冷却到期它又排回来，每次请求都先撞一次「额度已用尽」。
+                zero_balance=exc.kind == "quota_exceeded")
             last_error = exc
-            if not exc.retryable():
+            # **额度耗尽 / 登录失效必须换号，不能把客户端晾在错误上**：
+            # 这两类错都是「号坏了」而不是「请求坏了」，换下一个号就能成。
+            # 它们已在上面的 note_failure 里冷却（额度号余额归零），
+            # 不会死循环 —— 真没号可用时下一轮 select_account 返回 None，
+            # 走 _no_account_error 的分场景文案。
+            if not exc.retryable() and exc.kind not in ("auth", "quota_exceeded"):
                 break
             # **400「请重试」类错误不要立刻换号**：DashScope 的瞬时 400 与
             # 账号无关，换号也一样失败，反而把唯一可用账号排除掉。
             # 先短暂退避、同账号再试一次（上游通常几百毫秒就恢复）。
-            if exc.status == 400:
+            if exc.status == 400 and exc.kind != "quota_exceeded":
                 time.sleep(0.8)
                 continue
             exclude.add(account.id)
@@ -326,7 +403,42 @@ def _attempt(db, request, key, body: dict, realm: str):
             continue
     if last_error is not None:
         raise last_error
-    raise shared.PlatformRejected(
+    raise _no_account_error(db, realm)
+
+
+def _no_account_error(db, realm: str):
+    """「没有可用账号」要分清两种完全不同的原因。
+
+    原来一律回 `503 请先导入并确认状态为启用` —— 号明明有 100 个、只是全都
+    额度用尽时，这句话会把人往「去检查账号状态」的死路上带。这里先数一下
+    该区域到底有没有 active 号、其中多少个余额为 0，再给对应的话术。
+    """
+    try:
+        from admin.models import Account
+
+        query = db.query(Account.id, Account.balance_remain).filter(
+            Account.platform == loomy_accounts.PLATFORM,
+            Account.status == "active")
+        if realm:
+            query = query.filter(Account.domain == realm)
+        rows = query.all()
+    except Exception:  # noqa: BLE001 - 统计不出来就退回通用文案
+        rows = []
+    total = len(rows)
+    empty = sum(1 for _id, balance in rows if int(balance or 0) <= 0)
+    if total and empty >= total:
+        return shared.PlatformRejected(
+            402, "所有 Loomy 账号的积分都已用尽。等下一次余额同步或每日签到"
+                 "刷新到额度后会自动恢复，也可以现在去「账号池」给某个号充值/签到。",
+            kind="quota_exceeded", code="all_quota_exceeded")
+    if total:
+        # 有余额但全在冷却 / 熔断 / 在途占满：这不是"没有号"，是"此刻都不可用"。
+        return shared.PlatformRejected(
+            503, "Loomy 账号都在冷却或用满并发，请稍后重试（%d 个号可用但此刻排不上）"
+                 % total,
+            kind="server_error", code="all_cooling",
+            headers={"Retry-After": "10"})
+    return shared.PlatformRejected(
         503, "Loomy 没有可用账号（请先在控制台导入并确认状态为启用）",
         kind="server_error", code="no_available_account",
         headers={"Retry-After": "3"})
@@ -375,35 +487,52 @@ def _bill(key, account, model, result, *, request, started=None, error="",
                 error_kind=error, client_ip=_client_ip(request),
                 use_case="loomy-chat", seq=1,
                 ttfb_ms=ttfb, latency_ms=latency,
-                # 思考档位是**观测字段**：不传的话用量日志里这个平台永远是
-                # 「未记录」，看起来像「用户没设」，实际是「网关没记」。
                 reasoning_effort=shared.reasoning_effort_of_request(request))
     except Exception:  # noqa: BLE001
         logger.exception("Loomy 记账失败")
 
 
+def _settle(db, account) -> None:
+    """释放租约 + 记成功 + 提交（同步 DB，跟着工作线程一起跑）。"""
+    shared.release(account)
+    shared.note_success(account)
+    try:
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+
+
 async def _forward(body: dict, request, *, usage=None) -> JSONResponse:
-    """鉴权 -> 选号 -> 上游 -> 记账。"""
+    """鉴权 -> 选号 -> 上游 -> 记账。
+
+    ## 为什么每一步都要 `to_thread`
+
+    `admin.server` 是**单进程单 worker** 的 uvicorn。`shared.authenticate`
+    与 `_attempt` 都是纯同步实现（SQLAlchemy 同步会话 + `urlopen`），
+    直接 `await` 之外的地方调用就等于把事件循环钉死：一次上游卡顿会让
+    控制台、导入账号、同步接口全部失去响应，且 `DEFAULT_TIMEOUT=600`
+    意味着最坏要等 10 分钟。2026-11-05 线上事故即此。
+
+    放进工作线程后，阻塞只占一个线程，事件循环照常服务其它请求。
+    """
     from admin.db import SessionLocal
 
     realm = _realm(request)
     db = SessionLocal()
     try:
-        key = shared.authenticate(db, request, platform=_public(request))
+        key = await asyncio.to_thread(
+            shared.authenticate, db, request, platform=_public(request))
         try:
-            result, account, started = _attempt(db, request, key, body, realm)
+            result, account, started, stats = await asyncio.to_thread(
+                _attempt, db, request, key, body, realm)
         except shared.PlatformRejected:
             raise
         except client.UpstreamError as exc:
             return _fail(exc)
-        shared.release(account)
-        shared.note_success(account)
-        try:
-            db.commit()
-        except Exception:  # noqa: BLE001
-            db.rollback()
-        _bill(key, account, str(body.get("model") or ""), result,
-              request=request, started=started)
+        await asyncio.to_thread(_settle, db, account)
+        await asyncio.to_thread(
+            _bill, key, account, str(body.get("model") or ""), result,
+            request=request, started=started, stats=stats)
         return JSONResponse(result)
     finally:
         db.close()
@@ -437,45 +566,16 @@ async def chat_completions(request):
     return await _forward_stream(body, request)
 
 
-async def _forward_stream(body: dict, request):
-    """真流式：选号 -> 上游 SSE -> 逐帧转发 -> 收尾记账。"""
-    from admin.db import SessionLocal
+def _open_stream(db, request, key, body: dict, realm: str, stats: dict,
+                 model: str):
+    """选号 + 租约 + 上游建连（**同步阻塞，必须跑在工作线程里**）。
 
-    realm = _realm(request)
-    db = SessionLocal()
-    # ⚠️ 关闭必须是幂等的：正常路径由生成器的 finally 关（那时流已结束），
-    # 异常/提前返回路径由下面的 finally 关，两条路径都可能触发。
-    closed = {"done": False}
+    `client.chat_stream` 里那句 `opener.open(...)` 会一直阻塞到**响应头**
+    到达才返回，因此这一步和 `_attempt` 一样不能待在事件循环上。
 
-    def close_db() -> None:
-        if closed["done"]:
-            return
-        closed["done"] = True
-        try:
-            db.close()
-        except Exception:  # noqa: BLE001 - 关闭失败不该掩盖真正的错误
-            pass
-
-    try:
-        # ⚠️ `authenticate()` 必须在 try 内：它会对无效 API Key 抛
-        # HTTPException。原来它写在 try 之前，于是「匿名请求打流式端点」
-        # 这条最容易被触发的路径**必然泄漏一个 Session** ——
-        # 实测 60 次无效 Key 就能把连接池打满，之后普通查询也 30s 超时，
-        # 全站 DB 不可用，只能重启。
-        # （raccoon 的同一处早已用 try/finally 修好，loomy 漏了。）
-        key = shared.authenticate(db, request, platform=_public(request))
-        return await _forward_stream_inner(
-            db, body, request, realm, key, close_db)
-    except BaseException:
-        close_db()
-        raise
-
-
-async def _forward_stream_inner(db, body, request, realm, key, close_db):
-    model = str(body.get("model") or "")
-    # 分段耗时容器：**必须在调用 client.chat_stream 之前定义**。
-    # 它由上游流式读取器填 ttfb/total，再交给 _bill 记账。
-    stats: dict = {}
+    返回 `(chunks, account, last_error, started)`：`chunks` 为 None 表示
+    没拿到可用账号，调用方据此返回上游错误或 503。
+    """
     exclude: set[int] = set()
     account = None
     chunks = None
@@ -484,7 +584,9 @@ async def _forward_stream_inner(db, body, request, realm, key, close_db):
     for _ in range(MAX_ATTEMPTS):
         account = shared.select_account(
             db, storage=loomy_accounts.PLATFORM, realm=realm, key=key,
-            model=model, exclude_ids=exclude)
+            model=model, exclude_ids=exclude,
+            # 同上：零余额号不进候选，避免每次先撞一次 402 再换号。
+            min_balance=0)
         if account is None:
             break
         if not shared.lease(account):
@@ -501,43 +603,82 @@ async def _forward_stream_inner(db, body, request, realm, key, close_db):
             shared.note_failure(
                 db, account, kind=exc.kind, detail=exc.detail or exc.message,
                 status=exc.status, model=model, public_platform=PUBLIC,
-                cool_seconds=(600 if exc.kind in ("auth", "quota_exceeded") else 0))
+                cool_seconds=(600 if exc.kind in ("auth", "quota_exceeded") else 0),
+                zero_balance=exc.kind == "quota_exceeded")
             last_error = exc
             exclude.add(account.id)
-            if not exc.retryable():
+            # 额度耗尽 / 登录失效：号坏了不是请求坏了，换下一个号
+            # （与非流式 `_attempt` 同口径，见那里的注释）。
+            if (not exc.retryable()
+                    and exc.kind not in ("auth", "quota_exceeded")):
                 break
         except Exception as exc:  # noqa: BLE001
             shared.release(account)
             logger.exception("Loomy 流式调用失败 acc=%s", account.id)
             last_error = client.UpstreamError(str(exc), kind="network")
             exclude.add(account.id)
+    return chunks, account, last_error, started
+
+
+async def _forward_stream(body: dict, request):
+    """真流式：选号 -> 上游 SSE -> 逐帧转发 -> 收尾记账。"""
+    from admin.db import SessionLocal
+
+    # **强制要 usage 尾帧**：客户端没带 `stream_options.include_usage` 时
+    # 上游不发 usage —— `_bill` 记到 0 token，客户端的「消耗积分」
+    # 也永远是空。这是「积分不显示」的直接根因之一。
+    if body.get("stream") and not isinstance(
+            (body.get("stream_options") or {}).get("include_usage"), bool):
+        body = {**body, "stream_options": {"include_usage": True}}
+
+    realm = _realm(request)
+    db = SessionLocal()
+    # ⚠️ `authenticate()` 必须在 try 内：它会对无效 API Key 抛 HTTPException。
+    # 原来它写在 try 之前，于是「匿名请求打流式端点」这条最容易被触发的
+    # 路径**必然泄漏一个 Session** —— 实测 60 次无效 Key 就能把连接池打满，
+    # 之后普通查询也 30s 超时，全站 DB 不可用，只能重启。
+    _closed = {"done": False}
+
+    def _close_db() -> None:
+        if _closed["done"]:
+            return
+        _closed["done"] = True
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001 - 关闭失败不该掩盖真正的错误
+            pass
+
+    try:
+        key = await asyncio.to_thread(
+            shared.authenticate, db, request, platform=_public(request))
+    except BaseException:
+        _close_db()
+        raise
+    model = str(body.get("model") or "")
+    # 分段耗时容器：**必须在调用 client.chat_stream 之前定义**。
+    # 它由上游流式读取器填 ttfb/total，再交给 _bill 记账。
+    stats: dict = {}
+    chunks, account, last_error, started = await asyncio.to_thread(
+        _open_stream, db, request, key, body, realm, stats, model)
 
     if chunks is None:
-        close_db()
+        # **先算提示文案，再关会话** —— `_no_account_error` 要查库。
+        # 顺序写反会在关闭后的 Session 上查询，异常被上层吞成
+        # 一个没有信息的 500。
+        exhausted = _no_account_error(db, realm) if last_error is None else None
+        db.close()
         if last_error is not None:
             return _fail(last_error)
-        raise shared.PlatformRejected(
-            503, "Loomy 没有可用账号（请先在控制台导入并确认状态为启用）",
-            kind="server_error", code="no_available_account",
-            headers={"Retry-After": "3"})
+        raise exhausted
 
     holder: dict = {}
-    # ⚠️ 流式清理必须幂等，且必须有一个**不依赖生成器 finally** 的兜底。
-    #
-    # 为什么：ASGI spec 2.3 下客户端断连时 uvicorn 会 cancel 任务，
-    # 而 starlette 0.46.2 的 `stream_response` 既没有 `aclose()` 也没有
-    # `finally` —— 生成器的 finally 只能在**垃圾回收时**才跑到。
-    # 结果：客户端提前断开 → 租约不归还 → `MAX_IN_FLIGHT` 被吃满 →
-    # 该账号 `full=True` 永久退出号池，只有重启才恢复。
+    # ⚠️ 清理必须**幂等**，且要有一个**不依赖生成器 finally** 的兜底：
+    # ASGI spec 2.3 下客户端断连时 uvicorn 会 cancel 任务，starlette 的
+    # `stream_response` 既无 `aclose()` 也无 `finally`，生成器的 finally
+    # 只能等 GC。结果是租约不归还 → MAX_IN_FLIGHT 被吃满 → 该号
+    # `full=True` 永久退出号池，只有重启才恢复。
     # 实测：3 次「断在响应开始前」即吃满 3/3，等 5 秒 + 强制 gc 仍是 3。
-    #
-    # raccoon 已用 `BackgroundTask(cleanup)` 修好同一问题，这里照做。
-    cleaned = {"done": False}
-
-    def cleanup() -> None:
-        if cleaned["done"]:
-            return
-        cleaned["done"] = True
+    def _teardown() -> None:
         try:
             shared.release(account)
             shared.note_success(account)
@@ -547,12 +688,14 @@ async def _forward_stream_inner(db, body, request, realm, key, close_db):
                 db.rollback()
             except Exception:  # noqa: BLE001
                 pass
+        _bill(key, account, model, {"usage": holder.get("usage") or {}},
+              request=request, started=started, stats=stats)
         try:
-            _bill(key, account, model, {"usage": holder.get("usage") or {}},
-                  request=request, started=started, stats=stats)
-        except Exception:  # noqa: BLE001 - 记账失败不该影响连接关闭
-            logger.exception("Loomy 流式记账失败 acc=%s", getattr(account, "id", "?"))
-        close_db()
+            db.close()
+        except Exception:  # noqa: BLE001 - 关库失败不该掩盖真正的错误
+            pass
+
+    cleanup = make_cleanup(_teardown, on_error="Loomy 流式清理失败")
 
     def generator():
         try:
@@ -564,10 +707,15 @@ async def _forward_stream_inner(db, body, request, realm, key, close_db):
         finally:
             cleanup()
 
+    # **空闲心跳**：上游排队/限流/慢思考时整条流可能几十秒无字节，
+    # 客户端只能干等。每 8 秒发一帧 `: ping` 注释（SSE 规范，
+    # 所有标准解析器忽略），把「链路活着」变成可见事实。
+    safe_gen = bridge.with_pings(generator(), ping=bridge.CHAT_PING)
+
     return StreamingResponse(
-        generator(), media_type="text/event-stream",
+        safe_gen, media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        # 兜底：客户端断开 / task 被取消时，Starlette 仍会跑 background
+        # 兜底：客户端断开 / task 被取消时，Starlette 仍会跑 background。
         background=BackgroundTask(cleanup))
 
 
@@ -698,8 +846,15 @@ def _usage_with_credit(usage: dict, model: str) -> dict:
         pass
     credit = 0.0
     try:
-        raw = (usage or {}).get("credit")
-        credit = float(raw) if isinstance(raw, (int, float)) else 0.0
+        # 优先用**上游真实计费**：Loomy 的 usage 里带 `points_consumed`
+        # （官方客户端就从 `usage.points_consumed` 读每轮消耗）。
+        # 之前只认 `credit` 键 —— 上游明明报了真实消耗，我们却忽略它，
+        # 转头按倍率估算，客户端显示的「消耗积分」和流水全对不上。
+        for key in ("credit", "credits", "cost", "points_consumed", "points"):
+            raw = (usage or {}).get(key)
+            if isinstance(raw, (int, float)) and float(raw) > 0:
+                credit = float(raw)
+                break
     except (TypeError, ValueError):
         credit = 0.0
     if credit <= 0:
@@ -825,68 +980,24 @@ def _sse_from_chat(result: dict):
     yield b"data: [DONE]\n\n"
 
 
-def _anthropic_to_openai(body: dict) -> dict:
-    """Anthropic 请求体 → OpenAI 请求体。
-
-    委托给 `protocol_bridge.anthropic_to_openai`。
-
-    本地旧实现只挑 `type == "text"` 的 content 块，**完全丢掉**
-    `tools` / `tool_use` / `tool_result` —— 于是 Claude Code 系客户端在
-    执行工具的那一轮发上来的工具结果变成空正文，任务直接卡死。
-    桥的实现覆盖：tools 定义、assistant 的 tool_use → tool_calls、
-    user 的 tool_result → role="tool"、图片块、tool_choice。
-    """
-    from admin.platform import protocol_bridge
-
-    out = protocol_bridge.anthropic_to_openai(body)
-    return _apply_no_think(out)
-
-
-def _anthropic_usage_of(usage) -> dict:
-    """OpenAI usage → Anthropic usage（含缓存读取/写入两个单列字段）。
-
-    Anthropic 协议把缓存命中的输入 token 单独列在
-    `cache_read_input_tokens`，Claude Code 等客户端据此显示「缓存读取」。
-    漏了它，客户端命中率恒为 0，而网关侧账目是对的 —— 必须整份透出。
-    """
-    try:
-        from upstream_compat import anthropic_usage_from
-
-        out = anthropic_usage_from(usage)
-        if out is not None:
-            return out
-    except Exception:  # noqa: BLE001
-        pass
-    u = usage if isinstance(usage, dict) else {}
-    return {"input_tokens": int(u.get("prompt_tokens") or 0),
-            "output_tokens": int(u.get("completion_tokens") or 0),
-            "cache_read_input_tokens": 0,
-            "cache_creation_input_tokens": 0}
-
-
-def _openai_to_anthropic(result: dict, model: str) -> dict:
-    """OpenAI 响应 → Anthropic message 结构。"""
-    choice = (result.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    text = str(message.get("content") or "")
-    usage = result.get("usage") or {}
-    stop = {"length": "max_tokens", "tool_calls": "tool_use"}.get(
-        str(choice.get("finish_reason") or ""), "end_turn")
-    return {
-        "id": "msg_" + str(result.get("id") or "")[:24],
-        "type": "message",
-        "role": "assistant",
-        "model": model,
-        "content": [{"type": "text", "text": text}] if text else [],
-        "stop_reason": stop,
-        "usage": _anthropic_usage_of(usage),
-    }
-
-
 async def messages(request):
-    """Anthropic 协议。**流式请求真流式转发**，非流式才聚合。"""
+    """Anthropic 协议。**工具调用经协议桥全量映射**（修复执行工具中断）。
+
+    ## 历史坑（本次修复）
+
+    旧实现在请求方向把 `tools` 定义、assistant 的 `tool_use` 块、user 的
+    `tool_result` 块**全部丢弃**（只抽 text），在流式方向把
+    `delta.tool_calls` 静默丢掉、stop_reason 恒 `end_turn`。结果就是
+    「任务跑到执行工具的那一轮，客户端收到『助手结束回合』但没有调用，
+    突然终止」。现在整条链路交给 `protocol_bridge`：
+
+    * 请求：`anthropic_to_openai`（tools/tool_use/tool_result 全量映射）
+    * 非流式：`openai_to_anthropic`（tool_use 块 + thinking 块 + 缓存 usage）
+    * 流式：`anthropic_stream_relay`（tool_use 块 + input_json_delta +
+      thinking 块 + 空闲心跳 + 上游错误显式 error 事件）
+    """
     body = await _body_of(request)
-    normalized = _anthropic_to_openai(body)
+    normalized = bridge.anthropic_to_openai(body)
     model = str(body.get("model") or "")
     if not body.get("stream"):
         normalized["stream"] = False
@@ -897,31 +1008,12 @@ async def messages(request):
             payload = json.loads(response.body)
         except Exception:  # noqa: BLE001
             return response
-        return JSONResponse(_openai_to_anthropic(payload, model))
-    # 流式：上游逐帧 -> 转 Anthropic 事件 -> 立即下发
-    return await _forward_stream_anthropic(normalized, request, model)
-
-
-async def _forward_stream_anthropic(body: dict, request, model: str):
-    """把上游 OpenAI chunk 流翻成 Anthropic 事件流。
-
-    委托给 `protocol_bridge.anthropic_stream_relay`。
-
-    本地旧实现的两个致命遗漏（都会让 agent 型客户端在工具那一步停住）：
-      * `piece = delta.get("content") or delta.get("reasoning_content") or ""`
-        —— **从不读 `delta["tool_calls"]`**，工具调用被静默丢弃；
-      * `stop_reason` 硬编码 `"end_turn"`，客户端据此判断「助手结束了回合
-        但没有调用工具」，任务直接终止。
-    桥的实现输出正确的 `tool_use` 内容块
-    （content_block_start -> input_json_delta -> content_block_stop）并把
-    stop_reason 映射成 `tool_use`，另外补了思考块、空闲心跳与错误帧。
-    """
-    from admin.platform import protocol_bridge
-
-    inner = await _forward_stream(body, request)
+        return JSONResponse(bridge.openai_to_anthropic(payload, model))
+    # 流式：内层 OpenAI chunk 流 → 协议桥转 Anthropic 事件流
+    inner = await _forward_stream(normalized, request)
     if getattr(inner, "status_code", 200) >= 400:
         return inner
-    return protocol_bridge.anthropic_stream_relay(inner, model, prefix="msg_loomy")
+    return bridge.anthropic_stream_relay(inner, model, prefix="loomy")
 
 
 async def count_tokens(request):
@@ -939,48 +1031,18 @@ async def count_tokens(request):
     return JSONResponse({"input_tokens": cjk + max(1, (len(text) - cjk) // 4)})
 
 
-def _openai_to_responses(result: dict, model: str) -> dict:
-    """OpenAI chat.completion → Responses 结构。"""
-    choice = (result.get("choices") or [{}])[0]
-    message = choice.get("message") or {}
-    text = str(message.get("content") or "")
-    usage = result.get("usage") or {}
-    output = []
-    if text:
-        output.append({
-            "type": "message",
-            "id": "msg_" + str(result.get("id") or "")[:20],
-            "role": "assistant",
-            "content": [{"type": "output_text", "text": text}],
-        })
-    reasoning = str(message.get("reasoning_content") or "")
-    return {
-        "id": "resp_" + str(result.get("id") or "")[:20],
-        "object": "response",
-        "created_at": int(result.get("created") or 0),
-        "model": model or result.get("model") or "",
-        "status": "completed" if choice.get("finish_reason") == "stop" else "incomplete",
-        "output": output,
-        "output_text": text,
-        "reasoning_summary": reasoning[:2000] if reasoning else "",
-        "usage": {
-            "input_tokens": int(usage.get("prompt_tokens") or 0),
-            "output_tokens": int(usage.get("completion_tokens") or 0),
-            "total_tokens": int(usage.get("total_tokens") or 0),
-        },
-    }
-
-
 async def responses(request):
-    """OpenAI Responses 协议。**流式请求真流式转发**。"""
+    """OpenAI Responses 协议。**工具调用经协议桥全量映射**。
+
+    旧实现只认 `input` 的字符串形态，`function_call` /
+    `function_call_output` 输入项不认（Codex 的工具循环第二轮就断），
+    输出方向不发 function_call 项、流式没有
+    `response.function_call_arguments.delta`。整条链路现在交给
+    `protocol_bridge.responses_to_openai` / `openai_to_responses` /
+    `responses_stream_relay`。
+    """
     body = await _body_of(request)
-    normalized = dict(body)
-    raw_input = body.get("input")
-    if isinstance(raw_input, str):
-        normalized["messages"] = [{"role": "user", "content": raw_input}]
-    elif isinstance(raw_input, list):
-        normalized["messages"] = raw_input
-    normalized.setdefault("max_tokens", body.get("max_output_tokens") or 4096)
+    normalized = bridge.responses_to_openai(body)
     model = str(body.get("model") or "")
     if not body.get("stream"):
         normalized["stream"] = False
@@ -991,59 +1053,30 @@ async def responses(request):
             payload = json.loads(response.body)
         except Exception:  # noqa: BLE001
             return response
-        return JSONResponse(_openai_to_responses(payload, model))
-    return await _forward_stream_responses(normalized, request, model)
-
-
-async def _forward_stream_responses(body: dict, request, model: str):
-    """把上游流翻成 Responses 事件流（`response.output_text.delta`）。"""
-    inner = await _forward_stream(body, request)
+        return JSONResponse(bridge.openai_to_responses(payload, model))
+    inner = await _forward_stream(normalized, request)
     if getattr(inner, "status_code", 200) >= 400:
         return inner
+    return bridge.responses_stream_relay(inner, model, prefix="loomy")
 
-    async def relay():
-        resp_id = "resp_loomy_" + str(int(time.time() * 1000))
-        started = False
-        async for frame in inner.body_iterator:
-            text = frame.decode("utf-8", "replace") if isinstance(frame, bytes) else str(frame)
-            for line in text.split("\n"):
-                line = line.strip()
-                if not line.startswith("data:"):
-                    continue
-                payload = line[5:].strip()
-                if payload in ("", "[DONE]"):
-                    continue
-                try:
-                    chunk = json.loads(payload)
-                except ValueError:
-                    continue
-                choice = (chunk.get("choices") or [{}])[0]
-                delta = choice.get("delta") or {}
-                piece = delta.get("content") or delta.get("reasoning_content") or ""
-                if not piece:
-                    if choice.get("finish_reason") and started:
-                        yield ("data: %s\n\n" % json.dumps(
-                            {"type": "response.completed",
-                             "response": {"id": resp_id, "object": "response",
-                                          "status": "completed", "model": model}},
-                            ensure_ascii=False)).encode()
-                    continue
-                if not started:
-                    started = True
-                    yield ("data: %s\n\n" % json.dumps(
-                        {"type": "response.created",
-                         "response": {"id": resp_id, "object": "response",
-                                      "status": "in_progress", "model": model,
-                                      "output": []}},
-                        ensure_ascii=False)).encode()
-                yield ("data: %s\n\n" % json.dumps(
-                    {"type": "response.output_text.delta", "item_id": resp_id,
-                     "output_index": 0, "content_index": 0, "delta": piece},
-                    ensure_ascii=False)).encode()
 
-    return StreamingResponse(
-        relay(), media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+def _models_payload(db, request, realm: str) -> dict:
+    """`/v1/models` 的同步实现：选号 -> 取 token -> 拉模型目录。
+
+    同步网络调用，必须由调用方放进工作线程（理由同 `_attempt`）。
+    """
+    account = shared.select_account(
+        db, storage=loomy_accounts.PLATFORM, realm=realm,
+        key=shared.key_row(db, request))
+    if account is None:
+        return {
+            "object": "list", "data": shared.catalog_from_db(
+                db, loomy_accounts.PLATFORM),
+            "note": "号池没有可用 Loomy 账号，仅返回配置目录"}
+    data = loomy_accounts.ensure_token(db, account)
+    models = client.fetch_models(loomy_accounts.token_of(data), realm,
+                                 account_id=int(account.id or 0))
+    return {"object": "list", "data": models}
 
 
 async def list_models(request):
@@ -1051,45 +1084,66 @@ async def list_models(request):
     from admin.db import SessionLocal
 
     with SessionLocal() as db:
-        shared.authenticate(db, request, platform=PUBLIC)
         realm = _realm(request)
-        account = shared.select_account(
-            db, storage=loomy_accounts.PLATFORM, realm=realm,
-            key=shared.key_row(db, request))
-        if account is None:
-            return JSONResponse({
-                "object": "list", "data": shared.catalog_from_db(
-                    db, loomy_accounts.PLATFORM),
-                "note": "号池没有可用 Loomy 账号，仅返回配置目录"})
+        await asyncio.to_thread(
+            shared.authenticate, db, request, platform=PUBLIC)
         try:
-            data = loomy_accounts.ensure_token(db, account)
-            models = client.fetch_models(loomy_accounts.token_of(data), realm,
-                                         account_id=int(account.id or 0))
+            payload = await asyncio.to_thread(
+                _models_payload, db, request, realm)
         except client.UpstreamError as exc:
             return _fail(exc)
-    return JSONResponse({"object": "list", "data": models})
+    return JSONResponse(payload)
+
+
+def _balance_payload(db, request, realm: str) -> dict:
+    """`/v1/balance` 的同步实现（同步网络，交给工作线程跑）。"""
+    account = shared.select_account(
+        db, storage=loomy_accounts.PLATFORM, realm=realm,
+        key=shared.key_row(db, request))
+    if account is None:
+        return {"error": "no_available_account"}
+    data = loomy_accounts.ensure_token(db, account)
+    points = client.fetch_points_balance(
+        loomy_accounts.token_of(data), realm,
+        account_id=int(account.id or 0))
+    return {
+        "platform": PUBLIC, "realm": realm, "reachable": True,
+        "balance": points.get("available") or 0,
+        "available": points.get("available") or 0,
+        "base_balance": points.get("balance") or 0,
+        "daily_balance": points.get("daily_balance") or 0,
+        "unit": "points",
+        "raw": points.get("raw") or {},
+    }
 
 
 async def balance(request):
+    """`/v1/balance` —— **真实积分余额**。
+
+    ## 历史坑（本次修复）
+
+    之前调的是 `fetch_quota`（拿 models 列表当探针），`/v1/balance`
+    永远只回「reachable + 模型数」，一分钱余额都看不到 —— 客户端
+    面板的 Loomy 积分显示是空的。Loomy 有真实的积分接口
+    （`GET /points/balance`，`availableBalance = 基础 + 当日`），
+    现在直接返回它。
+    """
     from admin.db import SessionLocal
 
     with SessionLocal() as db:
-        shared.authenticate(db, request, platform=PUBLIC)
         realm = _realm(request)
-        account = shared.select_account(
-            db, storage=loomy_accounts.PLATFORM, realm=realm,
-            key=shared.key_row(db, request))
-        if account is None:
-            return JSONResponse({"platform": PUBLIC, "realm": realm,
-                                 "reachable": False, "models": 0,
-                                 "note": "号池没有可用账号"}, status_code=503)
+        await asyncio.to_thread(
+            shared.authenticate, db, request, platform=PUBLIC)
         try:
-            data = loomy_accounts.ensure_token(db, account)
-            quota = client.fetch_quota(loomy_accounts.token_of(data), realm,
-                                       account_id=int(account.id or 0))
+            payload = await asyncio.to_thread(
+                _balance_payload, db, request, realm)
         except client.UpstreamError as exc:
             return _fail(exc)
-    return JSONResponse({"platform": PUBLIC, "realm": realm, **quota})
+    if payload.get("error") == "no_available_account":
+        return JSONResponse({"platform": PUBLIC, "realm": realm,
+                             "reachable": False, "balance": 0,
+                             "note": "号池没有可用账号"}, status_code=503)
+    return JSONResponse(payload)
 
 
 _HANDLERS = {
