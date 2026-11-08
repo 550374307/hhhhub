@@ -17,6 +17,7 @@ from admin.db import SessionLocal
 from admin.models import Schedule
 from admin.config import settings
 from admin import maintenance
+from sqlalchemy import func, or_
 from admin.schedule_timing import timing_of, next_run_at
 from collections import Counter
 
@@ -49,34 +50,99 @@ def _short_error(e) -> str:
     return msg[:160]
 
 
+#: 结果里可能出现的「逐项明细」字段名。
+#:
+#: ⚠️ 各平台/各任务用的名字**不统一**：WorkBuddy 用 `detail`，Loomy 原来用
+#: `items`，还有 `accounts` / `rows` / `failed`。原来的裁剪逻辑只认 `detail`，
+#: 于是 Loomy 的 100 条明细完全砍不掉，最后走到「按字节硬截断」——
+#: 截出来的是**非法 JSON**，前端 `JSON.parse` 失败，只能把整段原文糊出来
+#: （就是「结果样式有问题 / 一整坨 json」）。这里把所有可能的字段都列上，
+#: 按体积从大到小砍，保证结构永远完整。
+_DETAIL_FIELDS = ("detail", "items", "accounts", "rows", "results", "failed")
+
+
+def _slim_detail(entry) -> object:
+    """把一条明细压缩到「前端画表只需要的那几个标量」。
+
+    明细里最占地方的是嵌套结构（上游原始响应、凭证片段）。
+    截断时先把这些去掉，往往一条就从几 KB 降到几百字节，
+    这样能保住**更多条数**，而不是一刀砍到 0 条。
+    """
+    if not isinstance(entry, dict):
+        return str(entry)[:200]
+    keep = {}
+    for key, value in entry.items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            keep[key] = value[:200] if isinstance(value, str) else value
+        elif isinstance(value, list) and len(value) <= 6:
+            keep[key] = value
+    return keep
+
+
 def _dump_result(result: dict) -> str:
     """序列化任务结果。
 
     这里**绝不能截断 JSON 字符串**：以前是 `json.dumps(...)[:500]`，
     一截断就成了非法 JSON，前端 `JSON.parse` 直接失败，看到的是
     一段被腰斩的原始文本 —— 正是「别只显示一堆 json 数据」的成因之一。
-    超长时改为丢弃明细数组里的项，保住 JSON 结构完整。
+
+    裁剪顺序（每一步都重新序列化，命中上限就停）：
+      1. 明细数组去嵌套 → 逐步减少条数（50 / 30 / 10 / 0）；
+      2. 仍然超长 → 丢掉全部明细，只留计数与 summary；
+      3. 最后才动字节（正常情况下永远走不到这一步）。
     """
     try:
-        text = json.dumps(result, ensure_ascii=False)
+        text = json.dumps(result, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
-        return json.dumps({"ok": False, "error": "结果无法序列化"},
+        try:
+            text = json.dumps(result, ensure_ascii=False, default=str)
+        except Exception:  # noqa: BLE001
+            return json.dumps({"ok": False, "error": "结果无法序列化"},
+                              ensure_ascii=False)
+    if len(text) <= _RESULT_LIMIT:
+        return text
+
+    # ---- 1) 逐个明细字段压缩 + 减条 ----
+    slim = dict(result)
+    for field in _DETAIL_FIELDS:
+        value = slim.get(field)
+        if isinstance(value, list) and value:
+            slim[field] = [_slim_detail(item) for item in value]
+    for keep in (50, 30, 10, 0):
+        candidate = dict(slim)
+        for field in _DETAIL_FIELDS:
+            value = candidate.get(field)
+            if isinstance(value, list):
+                candidate[field] = value[:keep] if keep else []
+                if keep and len(value) > keep:
+                    candidate["detail_truncated"] = True
+        try:
+            text = json.dumps(candidate, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            continue
+        if len(text) <= _RESULT_LIMIT:
+            return text
+        slim = candidate
+
+    # ---- 2) 丢掉全部明细，只留标量与 summary ----
+    head = {key: value for key, value in slim.items()
+            if not isinstance(value, list)}
+    head["detail_truncated"] = True
+    try:
+        text = json.dumps(head, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        text = json.dumps({"ok": False, "error": "结果过大且无法序列化"},
                           ensure_ascii=False)
     if len(text) <= _RESULT_LIMIT:
         return text
-    # 超长：先砍 detail（逐账号明细），保留计数与 summary
-    slim = dict(result)
-    detail = slim.get("detail")
-    if isinstance(detail, list):
-        for keep in (50, 20, 5, 0):
-            slim["detail"] = detail[:keep]
-            slim["detail_truncated"] = True
-            text = json.dumps(slim, ensure_ascii=False)
-            if len(text) <= _RESULT_LIMIT:
-                return text
-    slim.pop("detail", None)
-    text = json.dumps(slim, ensure_ascii=False)
-    return text if len(text) <= _RESULT_LIMIT else text[:_RESULT_LIMIT - 40] + '"}'
+
+    # ---- 3) 极端兜底：保住 JSON 结构，只留一句话 ----
+    return json.dumps({
+        "ok": head.get("ok", True),
+        "summary": str(head.get("summary") or "")[:400],
+        "detail_truncated": True,
+        "note": "结果过大，已省略明细",
+    }, ensure_ascii=False)
 
 
 
@@ -118,42 +184,205 @@ def _active_accounts(db, schedule=None, *, platform_only: bool = True):
 
 
 def run_refresh_balances(db, schedule=None) -> dict:
-    """refresh_balances（从 run_task 抽出，行为不变）。"""
-    from admin.routers import accounts as acc_router
+    """刷新余额快照 —— **只刷 stale 的，按代理槽并发，有时间预算**。
+
+    ## 为什么重写（2026-11-06 用户实测）
+
+    > 如果 1 并发查 100 个要 10 分钟，然后等下次余额刷新又是 10 分钟。
+    > 余额刷新会卡死，无限循环。
+
+    原实现三个问题叠在一起：
+
+      1. `_active_accounts(db, schedule)` **一次性读全表**并常驻内存
+         （每个 ORM 对象还带几百 KB 的 auth_json）—— 几千个号直接卡住；
+      2. 每轮都**全量重扫**，不管快照是不是刚更新过 —— 于是永远刷不完，
+         下一轮又从头开始，看起来就是「无限循环」；
+      3. 串行 + `account_slot` 的全局单飞锁，1 个 IP 上一个一个来。
+
+    现在：
+
+      · **只刷 stale**：`balance_synced_at` 落后 `stale_minutes`（默认 60）
+        或从来没刷过的号。刚刷过的直接跳过 —— 池子再大也不会重复劳动；
+      · **按主键分批**（`iter_account_batches`），不把号池读进内存；
+      · **按代理槽并发**：并发上限 = Σ(节点 max_concurrency)，
+        一个节点同时只跑它自己能承受的数量；
+      · **时间预算**（默认 8 分钟）：到点就停，剩下的下一轮接着刷。
+        **不追求一轮刷完** —— 这才是「不卡死」的正解。
+    """
     from admin.models import Account
-    ok = fail = 0
-    skipped = Counter()
+    from admin.platform import shared as platform_shared
+    from admin import proxy_pool
+    from admin.routers import accounts as acc_router
+
+    started = time.monotonic()
+
+    # ---- 参数：任务显式配置 > 全局默认 > 环境变量 > 内置默认 ----
+    # 全局默认来自「定时任务 → 全局出口与并发」（SystemSetting 单键 JSON，
+    # 2026-11-07 新增）：给所有没单独配置的任务统一出口/节奏，单个任务
+    # 填了值仍然以任务自己的为准。
+    gp = _schedule_global_proxy(db)
+    stale_minutes = (int(getattr(schedule, "stale_minutes", 0) or 0)
+                     or int(gp.get("stale_minutes") or 0)
+                     or _env_int("ADMIN_BALANCE_STALE_MINUTES", 60))
+    budget_minutes = (int(getattr(schedule, "time_budget_minutes", 0) or 0)
+                      or int(gp.get("time_budget_minutes") or 0)
+                      or _env_int("ADMIN_BALANCE_BUDGET_MINUTES", 8))
+    pool_name = (str(getattr(schedule, "proxy_pool", "") or "")
+                 or str(gp.get("proxy_pool") or ""))
+    configured = (int(getattr(schedule, "concurrency", 0) or 0)
+                  or int(gp.get("concurrency") or 0))
+
+    slots = proxy_pool.slots(db, pool_name)
+    auto = len(slots) if slots else _env_int("ADMIN_BALANCE_CONCURRENCY", 4)
+    workers = configured or auto
+    workers = max(1, min(64, workers))
+
+    deadline = started + budget_minutes * 60
+    cutoff = datetime.utcnow() - timedelta(minutes=max(1, stale_minutes))
+
+    storage = (getattr(schedule, "platform", "") or "workbuddy").strip() or "workbuddy"
+    counters = {"ok": 0, "fail": 0, "skipped": 0, "stale": 0, "budget_hit": False}
     failed_names: list[str] = []
-    for a in _active_accounts(db, schedule):
-        with maintenance.account_slot(a, db) as reason:
-            if reason:
-                skipped[reason] += 1
+    skip_reasons = Counter()
+
+    # 槽位分配：每个 worker 线程按下标拿一个出口，销毁前不会变
+    # （同一线程内的所有请求走同一个 IP，比每条请求换 IP 更像真人）
+    def slot_for(index: int) -> str:
+        if not slots:
+            return ""
+        return slots[index % len(slots)]["url"]
+
+    def worker(session, account):
+        nonlocal counters
+        if time.monotonic() > deadline:
+            counters["budget_hit"] = True
+            return {"account_id": account.id, "ok": True, "skipped": "budget"}
+        reason = maintenance._reason(account)
+        if reason:
+            return {"account_id": account.id, "ok": True, "skipped": reason}
+        # 槽位按账号 id 取模：同一个号固定走同一个出口（避免「同一个号
+        # 每次换 IP」这种比不用代理更可疑的形状）
+        url = slots[account.id % len(slots)]["url"] if slots else ""
+        ok = acc_router._refresh_balance(
+            account, with_expiry=True, proxy=url,
+            on_error=lambda error: maintenance.note_failure(session, account, error))
+        try:
+            session.commit()
+        except Exception:  # noqa: BLE001
+            session.rollback()
+        endpoint_id = slots[account.id % len(slots)]["endpoint_id"] if slots else None
+        if ok:
+            proxy_pool.mark_ok(session, endpoint_id)
+        return {"account_id": account.id, "ok": ok,
+                "account": _account_label(account),
+                "error": "" if ok else (getattr(account, "last_err_msg", "") or "")[:120],
+                "endpoint_id": endpoint_id}
+
+    # ---- 只捞 stale 的 id，按批处理 ----
+    seen = 0
+    for batch_ids in platform_shared.iter_account_batches(
+            db, storage=storage, status="active",
+            batch=max(workers * 4, 40)):
+        if time.monotonic() > deadline:
+            counters["budget_hit"] = True
+            break
+        # 过滤：只要 stale 的（`balance_synced_at` 空或早于 cutoff）。
+        #
+        # 顺便在 SQL 层就排掉「冷却 / 熔断 / 降权中」的号 —— 它们进去也是
+        # 被 `_reason()` 跳过，白白占一轮的 stale 配额。池子上千时，
+        # 光这一条就能把每轮的无效往返砍掉一大块。
+        now_utc = datetime.utcnow()
+        stale_ids = [int(row[0]) for row in
+                     (db.query(Account.id)
+                      .filter(Account.id.in_(batch_ids),
+                              Account.status == "active",
+                              or_(Account.balance_synced_at.is_(None),
+                                  Account.balance_synced_at < cutoff),
+                              or_(Account.cool_until.is_(None),
+                                  Account.cool_until <= now_utc),
+                              or_(Account.breaker_until.is_(None),
+                                  Account.breaker_until <= now_utc))
+                      .order_by(Account.id.asc()).all())]
+        if not stale_ids:
+            continue
+        counters["stale"] += len(stale_ids)
+        seen += len(stale_ids)
+        rows = platform_shared.run_account_batch(
+            stale_ids, worker, concurrency=workers, label="refresh-balances")
+        for row in rows:
+            if row.get("skipped"):
+                counters["skipped"] += 1
+                skip_reasons[str(row["skipped"])] += 1
                 continue
-            # with_expiry=True：顺带同步「积分包到期快照」。
-            # 这个快照是选号策略（expiring / weighted）的依据 —— 之前
-            # credits_expiring 长期是 0，导致「先用快过期的额度」这条规则
-            # 实际上从未生效。
-            if acc_router._refresh_balance(a, with_expiry=True,
-                                           on_error=lambda error: maintenance.note_failure(db, a, error)):
-                ok += 1
+            if row.get("ok"):
+                counters["ok"] += 1
             else:
-                fail += 1
-                failed_names.append(_account_label(a))
-            db.commit()
-    rows = _active_accounts(db, schedule)
-    expiring = sum(int(a.credits_expiring or 0) for a in rows)
-    expiring_soon = sum(int(a.credits_expiring_soon or 0) for a in rows)
-    return {"task": "refresh_balances", "ok": True, "refreshed": ok, "failed": fail,
-            "skipped": sum(skipped.values()), "skip_reasons": dict(skipped),
-            "credits_expiring": expiring,
-            "credits_expiring_soon": expiring_soon,
-            "failed_accounts": failed_names[:10],
-            "summary": (f"刷新成功 {ok} 个账号"
-                        + (f"，7 天内到期积分 {expiring_soon}" if expiring_soon
-                           else (f"，快过期积分 {expiring}" if expiring else ""))
-                        + (f"，{fail} 个失败：{'、'.join(failed_names[:3])}"
-                           if fail else "")
-                        + (f"，{sum(skipped.values())} 个因保护或占用跳过" if skipped else ""))}
+                counters["fail"] += 1
+                if len(failed_names) < 10:
+                    failed_names.append(row.get("account") or str(row.get("account_id")))
+
+    elapsed = round(time.monotonic() - started, 1)
+    totals = db.query(
+        func.coalesce(func.sum(Account.credits_expiring), 0),
+        func.coalesce(func.sum(Account.credits_expiring_soon), 0),
+    ).filter(Account.status == "active").one()
+
+    summary = ("刷新成功 %d 个" % counters["ok"])
+    if counters["stale"]:
+        summary += "（本轮 stale %d 个" % counters["stale"]
+        if counters["budget_hit"]:
+            summary += "，到 %d 分钟预算，剩余下轮继续" % budget_minutes
+        summary += "）"
+    if counters["skipped"]:
+        summary += "，%d 个跳过" % counters["skipped"]
+    if counters["fail"]:
+        summary += "，%d 个失败：%s" % (counters["fail"], "、".join(failed_names[:3]))
+    summary += " · %s" % ("%d 个出口" % len(slots) if slots else "直连")
+    summary += " · 并发 %d · 用时 %ss" % (workers, elapsed)
+
+    return {
+        "task": "refresh_balances", "ok": True,
+        "refreshed": counters["ok"], "failed": counters["fail"],
+        "skipped": counters["skipped"], "skip_reasons": dict(skip_reasons),
+        "stale_pending": counters["stale"],
+        "budget_hit": counters["budget_hit"],
+        "concurrency": workers, "proxy_slots": len(slots),
+        "proxy_pool": pool_name or "直连",
+        "credits_expiring": int(totals[0] or 0),
+        "credits_expiring_soon": int(totals[1] or 0),
+        "failed_accounts": failed_names,
+        "elapsed_s": elapsed,
+        "summary": summary,
+    }
+
+
+def _env_int(name: str, default: int) -> int:
+    import os
+
+    try:
+        return int(os.getenv(name, default) or default)
+    except (TypeError, ValueError):
+        return default
+
+
+def _schedule_global_proxy(db) -> dict:
+    """「全局出口与并发」默认值（SystemSetting 单键 JSON）。
+
+    读不到 / 坏数据一律返回全零 dict —— 零值在调用侧的含义是
+    「这项没配，继续往下落（环境变量 / 内置默认）」。
+    任务执行时才查库（一条主键查询，不在请求热路径上），改完立即生效。
+    """
+    from admin.models import SystemSetting
+
+    try:
+        row = db.query(SystemSetting).filter(
+            SystemSetting.key == "schedule:global_proxy").first()
+        if not row or not row.value:
+            return {}
+        data = json.loads(row.value)
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 - 配置读不出来不能挡任务
+        return {}
 
 
 def run_refresh_credits(db, schedule=None) -> dict:
@@ -249,6 +478,7 @@ TASK_RUNNERS = {
     "run_growth_plan": None,
     "keepalive_tokens": None,
     "ban_recheck": None,
+    "daily_activity": None,
 }
 
 
@@ -276,10 +506,20 @@ def _fill_task_runners() -> None:
         "run_growth_plan": run_growth_plan,
         "keepalive_tokens": run_keepalive_tokens,
         "ban_recheck": run_ban_recheck,
+        # 每日让每个号真的说一句话：只刷 token 不发对话的号，
+        # 在上游眼里就是「机器在养号」，比不发请求更容易吃 11140。
+        "daily_activity": _run_daily_activity,
     }
     for name, fn in mapping.items():
         if TASK_RUNNERS.get(name) is None:
             TASK_RUNNERS[name] = _adapt_runner(fn)
+
+
+def _run_daily_activity(db, schedule=None):
+    """调度层包装：把 `run_daily_activity(db)` 的签名对齐成 `(db, schedule)`。"""
+    from admin.daily_activity import run_daily_activity
+
+    return run_daily_activity(db)
 
 
 def _adapt_runner(fn):
@@ -376,18 +616,31 @@ def _platform_runner(task: str, schedule):
         platform = _platform_of(schedule)
         if not platform:
             return None
+        realm_hint = str(getattr(schedule, "realm", "") or "").strip().lower()
         spec = registry.get(platform)
-        if spec is None:
-            # schedule 存的是**落库平台**（trae / qoder），而 registry 里
-            # 是区级 id（trae-cn / trae-intl）。取不到就按 storage 反查一个区，
-            # 否则 Trae 的签到任务永远「该平台未注册此任务」。
+        # 「platform 是区级 id 还是落库平台名」不能只看 registry 命中：
+        # Qoder 中国版的对外 id 恰好就是落库名 `qoder`（registry 直接命中
+        # cn spec），只看命中会把双区任务锁死在中国版。**storage 等于
+        # platform 本身 = 落库平台名**，才走多区/通配分支。
+        if spec is not None and spec.storage() != platform:
+            # 任务绑的是**区级对外 id**（qoder-intl / trae-cn）：只跑这个区
+            gateway = registry.load_platform_gateway(spec, spec.realm)
+        else:
             candidates = [sp for sp in registry.all_platforms()
                           if sp.storage() == platform]
-            if not candidates:
+            if spec is None and not candidates:
                 return None
-            realm = str(getattr(schedule, "realm", "") or "").strip().lower()
-            spec = next((sp for sp in candidates if sp.realm == realm), candidates[0])
-        gateway = registry.load_platform_gateway(spec, spec.realm)
+            spec = next((sp for sp in candidates if sp.realm == realm_hint), None)
+            if spec is not None:
+                gateway = registry.load_platform_gateway(spec, spec.realm)
+            else:
+                # **多区落库平台 + 任务未绑区（2026-11-07 修复）**：
+                # 此前恒落默认区（qoder→cn），国际版账号的签到/保活整批
+                # 漏跑（Qoder 9 个 intl 号每次 refreshed=0 就是这么来的）。
+                # 不带区实例化，让平台 runner 按**账号自己的区**跑。
+                if spec is None:
+                    spec = candidates[0]
+                gateway = registry.load_platform_gateway(spec, "")
         if gateway is None:
             _logger.debug("平台 %s 没有管理契约，无法取任务", platform)
             return None
@@ -816,10 +1069,11 @@ def run_growth_tasks() -> dict:
                     .filter(Account.status == "active",
                             Account.platform == _platform_of(_current_schedule()))
                     .order_by(Account.id.asc()).all())
+        accounts = growth_eligible(accounts)
         ids = [a.id for a in accounts]
         if not ids:
             return {"task": "run_growth_tasks", "ok": True, "accounts": 0,
-                    "msg": "没有可用账号"}
+                    "msg": "没有可用账号（企业版账号没有成长任务）"}
 
         run_res = growth_router.run_accounts(
             ids, None, db,
@@ -937,6 +1191,19 @@ def run_refresh_growth_tasks() -> dict:
     }
 
 
+def growth_eligible(accounts):
+    """过滤掉**企业版账号**。
+
+    企业版（`enterpriseId` 非空）在官方客户端里没有「签到 / 成长任务 /
+    猫猫旅行」这些活动：它们属于个人版的运营玩法。用企业号去打这些接口
+    只会拿到 1002/1003 之类的"无资格"，既浪费请求、又把结果页刷成一片红。
+
+    判据与 `converter.ClientManager.is_enterprise()` 一致：读落库的
+    `enterprise_id`，不额外发请求。
+    """
+    return [a for a in accounts if not (getattr(a, "enterprise_id", "") or "").strip()]
+
+
 def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
     """遍历活跃账号执行每日签到领取积分。
 
@@ -948,9 +1215,20 @@ def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
 
     结果里除了计数，还逐账号记录「领到多少分 / 没领成功的原因」：
     只给一个 `failed: 3` 等于没说 —— 用户真正想知道的是**哪个号**失败了、**为什么**。
+
+    ## 并发（2026-11-06）
+
+    这里是**纯网络等待**（每号 2 次上游 HTTP），串行时 100 个号要几分钟，
+    期间调度线程一直占着，别的任务只能排队 —— 用户看到的就是「签到一跑，
+    整个后台发卡」。现在按批取号 + 线程池并发，每个号独立 Session，
+    墙钟时间按并发度成比例下降，内存只保留在当前批。
+
+    并发度默认 `ADMIN_CHECKIN_CONCURRENCY`（缺省 6，比平台通用批处理更保守）：
+    WorkBuddy 的签到接口对同 IP 高频请求敏感，太快反而整批 429/风控。
     """
     from admin.models import Account
     from admin.backend import AccountSession
+    from admin.platform import shared as platform_shared
 
     now = datetime.utcnow()
 
@@ -961,80 +1239,112 @@ def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
                     "skipped": "已超过停止领取时间，不再请求",
                     "stop_after": schedule.stop_after.isoformat()}
 
-    accounts = (db.query(Account).filter(Account.status == "active")
-                .filter(Account.platform == _platform_of(schedule))
-                .order_by(Account.id.asc()).all())
-    if not accounts:
+    storage = _platform_of(schedule)
+    # 分批取号：号池再大，内存里也只有一批对象。
+    eligible: list[int] = []
+    for ids in platform_shared.iter_account_batches(
+            db, storage=storage, status="active", batch=200):
+        rows = db.query(Account).filter(Account.id.in_(ids)).all()
+        # 企业版没有签到活动，先剔掉再判断「有没有账号」
+        eligible.extend(a.id for a in growth_eligible(rows))
+    if not eligible:
         return {"task": "daily_checkin", "ok": True, "total": 0,
-                "msg": "没有可用账号"}
+                "msg": "没有可用账号（企业版账号不参与签到）"}
 
-    claimed = skipped_already = failed = 0
-    total_credit = 0
-    ended = False
-    errors: list[str] = []          # 保留旧字段，兼容既有调用方
-    detail: list[dict] = []         # 新增：逐账号明细（供后台展示）
+    import os
 
-    for a in accounts:
+    def _concurrency() -> int:
+        try:
+            value = int(os.getenv("ADMIN_CHECKIN_CONCURRENCY", "6") or 6)
+        except (TypeError, ValueError):
+            value = 6
+        return max(1, min(16, value))
+
+    ended_box = {"ended": False}
+
+    def worker(session, a) -> dict:
+        """单个账号的签到（跑在线程池里，`session` 是本任务私有的）。"""
         label = _account_label(a)
         try:
             with AccountSession(a.auth_json) as sess:
                 st = sess.get_checkin_status()
                 if st.get("today_checked_in"):
-                    skipped_already += 1
-                    detail.append({"account_id": a.id, "account": label,
-                                   "ok": True, "status": "already",
-                                   "credit": 0, "reason": "今日已领过"})
-                else:
-                    res = sess.claim_daily_checkin()
-                    if res.get("ok"):
-                        credit = int(res.get("credit") or 0)
-                        claimed += 1
-                        total_credit += credit
-                        from admin.growth_center import record_result
-                        reward_record = record_result(db, a.id, {"ok": True, "credit": credit}, source="schedule", action="每日打卡")
-                        try:
-                            from admin.routers.accounts import _sync_credit_snapshot
-                            balance = sess.fetch_balance()
-                            a.balance_total = int(balance.get("total") or 0)
-                            a.balance_remain = int(balance.get("remain") or 0)
-                            from admin.credit_journal import attach_balance
-                            attach_balance(db, [reward_record], a.balance_remain)
-                            a.last_sync_at = datetime.utcnow()
-                            _sync_credit_snapshot(a, sess.fetch_credit_details())
-                        except Exception as error:
-                            errors.append(f"{label}:奖励已领取，余额或到期快照刷新失败")
-                            _logger.warning("签到后资源刷新失败 account_id=%s: %s", a.id, type(error).__name__)
-                        detail.append({
-                            "account_id": a.id, "account": label, "ok": True,
+                    # token 也可能在这里被刷新过，写回
+                    a.auth_json = sess.updated_json()
+                    session.commit()
+                    return {"account_id": a.id, "account": label,
+                            "ok": True, "status": "already",
+                            "credit": 0, "reason": "今日已领过"}
+                res = sess.claim_daily_checkin()
+                if res.get("ok"):
+                    credit = int(res.get("credit") or 0)
+                    from admin.growth_center import record_result
+                    reward_record = record_result(
+                        session, a.id, {"ok": True, "credit": credit},
+                        source="schedule", action="每日打卡")
+                    note = ""
+                    try:
+                        from admin.routers.accounts import _sync_credit_snapshot
+                        balance = sess.fetch_balance()
+                        a.balance_total = int(balance.get("total") or 0)
+                        a.balance_remain = int(balance.get("remain") or 0)
+                        from admin.credit_journal import attach_balance
+                        attach_balance(session, [reward_record],
+                                       a.balance_remain)
+                        a.last_sync_at = datetime.utcnow()
+                        _sync_credit_snapshot(a, sess.fetch_credit_details())
+                    except Exception as error:
+                        note = "奖励已领取，余额或到期快照刷新失败"
+                        _logger.warning(
+                            "签到后资源刷新失败 account_id=%s: %s",
+                            a.id, type(error).__name__)
+                    a.auth_json = sess.updated_json()
+                    session.commit()
+                    return {"account_id": a.id, "account": label, "ok": True,
                             "status": "claimed", "credit": credit,
                             "streak_days": int(res.get("streak_days") or 0),
-                            "reason": f"+{credit} 积分",
-                        })
-                    elif res.get("status") == "event_ended":
-                        ended = True
-                        failed += 1
-                        reason = "活动已结束"
-                        errors.append(f"{label}:{reason}")
-                        detail.append({"account_id": a.id, "account": label,
-                                       "ok": False, "status": "event_ended",
-                                       "credit": 0, "reason": reason})
-                    else:
-                        failed += 1
-                        reason = res.get("status") or res.get("msg") or "未知原因"
-                        errors.append(f"{label}:{reason}")
-                        detail.append({"account_id": a.id, "account": label,
-                                       "ok": False, "status": "failed",
-                                       "credit": 0, "reason": str(reason)})
-                # 写回可能已刷新的 token（签到请求会触发鉴权头刷新）
+                            "reason": ("+%d 积分" % credit) + (
+                                "（%s）" % note if note else "")}
+                if res.get("status") == "event_ended":
+                    ended_box["ended"] = True
+                    a.auth_json = sess.updated_json()
+                    session.commit()
+                    return {"account_id": a.id, "account": label,
+                            "ok": False, "status": "event_ended",
+                            "credit": 0, "reason": "活动已结束"}
+                reason = res.get("status") or res.get("msg") or "未知原因"
                 a.auth_json = sess.updated_json()
-                db.commit()
-        except Exception as e:
-            failed += 1
-            reason = _short_error(e)
-            errors.append(f"{label}:{reason}")
-            detail.append({"account_id": a.id, "account": label, "ok": False,
-                           "status": "error", "credit": 0, "reason": reason})
+                session.commit()
+                return {"account_id": a.id, "account": label,
+                        "ok": False, "status": "failed", "credit": 0,
+                        "reason": str(reason)}
+        except Exception as e:  # noqa: BLE001 - 单号失败不影响其它号
+            return {"account_id": a.id, "account": label, "ok": False,
+                    "status": "error", "credit": 0,
+                    "reason": _short_error(e)}
 
+    rows = platform_shared.run_account_batch(
+        eligible, worker, concurrency=_concurrency(), label="wb-checkin")
+
+    claimed = skipped_already = failed = 0
+    total_credit = 0
+    errors: list[str] = []
+    detail: list[dict] = []
+    for row in rows:
+        status = row.get("status")
+        if status == "claimed":
+            claimed += 1
+            total_credit += int(row.get("credit") or 0)
+        elif status == "already":
+            skipped_already += 1
+        else:
+            failed += 1
+            errors.append("%s:%s" % (row.get("account") or row.get("account_id"),
+                                     row.get("reason") or ""))
+        if len(detail) < 60:
+            detail.append(row)
+
+    ended = ended_box["ended"]
     # 发现活动已结束：自动把停止时间设为今天，防止后续继续请求
     if ended and schedule is not None:
         schedule.stop_after = now
@@ -1043,7 +1353,7 @@ def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
     result = {
         "task": "daily_checkin",
         "ok": True,
-        "total": len(accounts),
+        "total": len(rows),
         "claimed": claimed,
         "skipped_already": skipped_already,
         "failed": failed,
@@ -1051,6 +1361,7 @@ def run_daily_checkin(db, schedule: "Schedule | None" = None) -> dict:
         "activity_ended": ended,
         "errors": errors[:10],
         "detail": detail,
+        "detail_truncated": len(rows) > len(detail),
     }
     result["summary"] = _checkin_summary(result)
     return result
@@ -1083,38 +1394,52 @@ def run_trae_checkin(db, schedule: "Schedule | None" = None) -> dict:
                 "detail": [],
                 "summary": "Trae 国际版没有签到接口，已跳过"}
 
-    rows = trae_pool.accounts_for(db, realm)
-    active = [a for a in rows if (a.status or "") == "active"]
-    detail, claimed, already, failed, credit = [], 0, 0, 0, 0
+    # 并发执行：每个号一次上游 claim，串行时号池一多就慢得离谱
+    # （与 WorkBuddy 签到同一套批处理：按批取号 + 线程池 + 独立 Session）。
+    from admin.platform import shared as platform_shared
 
-    for account in active:
-        item = {"account_id": account.id, "account": account.name or "", "ok": False,
-                "status": "", "credit": 0, "reason": ""}
+    rows = trae_pool.accounts_for(db, realm)
+    active = [a.id for a in rows if (a.status or "") == "active"]
+    if not active:
+        return {"task": "trae_checkin", "ok": True, "total": 0,
+                "claimed": 0, "skipped_already": 0, "failed": 0, "credit": 0,
+                "detail": [], "summary": "没有可签到的账号"}
+
+    def worker(session, account):
+        item = {"account_id": account.id, "account": account.name or "",
+                "ok": False, "status": "", "credit": 0, "reason": ""}
         try:
-            creds = trae_pool.credentials(db, account)
+            creds = trae_pool.credentials(session, account)
             result = trae_client.claim_checkin(creds, realm)
             gained = int(result.get("earned_credit") or 0)
-            credit += gained
             item.update({
                 "ok": bool(result.get("ok")),
                 "credit": gained,
                 "status": "already" if result.get("already") else "claimed",
                 "reason": result.get("message") or "",
             })
-            if result.get("already"):
-                already += 1
-            elif result.get("ok"):
-                claimed += 1
-            else:
-                failed += 1
         except trae_client.UpstreamError as exc:
-            failed += 1
             item.update({"status": "failed", "reason": "%s: %s" % (
                 exc.code or exc.status, (exc.message or "")[:120])})
         except Exception as exc:  # noqa: BLE001 - 单号失败不影响其它号
-            failed += 1
             item.update({"status": "failed", "reason": str(exc)[:120]})
-        detail.append(item)
+        return item
+
+    results = platform_shared.run_account_batch(
+        active, worker, label="trae-checkin")
+
+    detail, claimed, already, failed, credit = [], 0, 0, 0, 0
+    for item in results:
+        credit += int(item.get("credit") or 0)
+        status = item.get("status")
+        if status == "already":
+            already += 1
+        elif item.get("ok"):
+            claimed += 1
+        else:
+            failed += 1
+        if len(detail) < 60:
+            detail.append(item)
 
     bits = []
     if claimed:
@@ -1235,32 +1560,15 @@ def _run_one(s: Schedule, db, now: datetime):
     except Exception as e:  # 单个任务失败不影响调度循环
         s.last_result = json.dumps(
             {"ok": False, "error": _short_error(e)}, ensure_ascii=False)[:2000]
-        # ⚠️ 必须 rollback，否则 session 进入「需要回滚」状态，
-        # 后面那句 `db.commit()` 会抛 PendingRollbackError。
-        # 而这个异常会**逃出 _run_one** —— 调用方 `_loop()` 的
-        # `for s in schedules: _run_one(...)` 因此整体中断，
-        # 该轮剩下的所有任务都不再执行（且不会重试下一轮，
-        # 因为 next_run_at 没被推进，表面上永远是「等下一次」）。
-        #
-        # 实测后果：一个任务抛异常，keepalive / refresh_credits
-        # 就**永久饿死**（6 轮复刻，从未被执行）。
-        try:
-            db.rollback()
-        except Exception:  # noqa: BLE001 - 回滚失败也不能让调度器停摆
-            logger.exception("调度 %s 回滚失败", getattr(s, "task", "?"))
     s.last_run_at = now
     s.next_run_at = (now + timedelta(minutes=1) if s.task == "keepalive_tokens"
                      and result.get("retry_pending") else next_run_at(s, now))
-    # 同上：commit 本身也可能失败（锁等待/写入冲突），
-    # 不能让它把整个调度循环带走。
-    try:
-        db.commit()
-    except Exception:  # noqa: BLE001
-        logger.exception("调度 %s 提交失败", getattr(s, "task", "?"))
-        try:
-            db.rollback()
-        except Exception:  # noqa: BLE001
-            pass
+    db.commit()
+
+
+#: 上次平台任务补种的时间（monotonic）。新平台接入 / 新账号导入后，
+#: 不必重启进程就能拿到定时任务 —— 导入成功路径也会立刻补一次，这里只是兜底。
+_last_platform_seed = 0.0
 
 
 def _loop():
@@ -1269,31 +1577,20 @@ def _loop():
         try:
             db = SessionLocal()
             now = datetime.utcnow()
+            global _last_platform_seed
+            if time.monotonic() - _last_platform_seed > 900:
+                _last_platform_seed = time.monotonic()
+                try:
+                    ensure_platform_schedules(db)
+                except Exception:  # noqa: BLE001 - 兜底失败不能停调度
+                    _logger.exception("平台定时任务兜底补种失败")
             schedules = db.query(Schedule).filter(Schedule.enabled == 1).all()
             # 先启动独立的成长巡检线程，再执行原有同步任务。旧的一次性
             # 成长任务可能很长，不能让它拖延已经到期的每日活跃巡检。
             schedules.sort(key=lambda s: s.task != "run_growth_plan")
             for s in schedules:
                 if s.next_run_at is None or s.next_run_at <= now:
-                    # ⚠️ 逐个隔离：一个任务抛异常不能中断本轮剩下的任务。
-                    # _run_one 内部已经处理了主要异常并 rollback，
-                    # 这里是最后一道保险（例如它的 rollback 本身也失败）。
-                    try:
-                        _run_one(s, db, now)
-                    except Exception:  # noqa: BLE001
-                        logger.exception(
-                            "调度任务 %s 抛出未捕获异常，跳过并继续本轮",
-                            getattr(s, "task", "?"))
-                        try:
-                            db.rollback()
-                        except Exception:  # noqa: BLE001
-                            # session 已经不可用：重建一个，避免本轮后续
-                            # 任务全部因同一个坏 session 而失败。
-                            try:
-                                db.close()
-                            except Exception:  # noqa: BLE001
-                                pass
-                            db = SessionLocal()
+                    _run_one(s, db, now)
         except Exception:
             # 数据库短暂不可用（如 MySQL 重启）时静默跳过本轮，下一轮再试。
             # 原先的写法在 `SessionLocal()` 本身抛异常时会引用未赋值的 db，
@@ -1436,6 +1733,36 @@ def ensure_daily_checkin(db):
         db.commit()
 
 
+def ensure_daily_activity_schedule(db):
+    """补齐「每日活跃对话」定时任务（幂等）。
+
+    ## 为什么这个任务必须有（2026-11-06 用户实测反馈）
+
+    > 被 11140 的账号都是那种用过我们系统之后没怎么继续经常用的账号。
+
+    上游看的是账号**自己的**行为画像。我们闲置的号：token 天天刷，
+    但只打 `/userinfo`、`/balance`、`/points` 这类管理接口，**一条对话都没有**
+    —— 这就是最典型的「机器在养号」形状，比不发请求更容易被判风控。
+
+    所以除了 token 保活，还要每天让每个号**真的说一句话**。
+    间隔 24 小时 + 任务启动漂移，避免整点批量。
+
+    环境变量 `ADMIN_DAILY_ACTIVITY=0` 可关闭。
+    """
+    if db.query(Schedule).filter(Schedule.task == "daily_activity").count():
+        return
+    from datetime import timedelta
+
+    from admin import humanize
+
+    now = datetime.utcnow()
+    # 首次触发往后推一个随机量（0~90 分钟），别和别的任务挤在同一分钟
+    first = now + timedelta(seconds=max(0.0, humanize.human_start_delay(5400.0)))
+    db.add(Schedule(name="每日活跃对话（模拟真人使用）", task="daily_activity",
+                    interval_minutes=1440, enabled=1, next_run_at=first))
+    db.commit()
+
+
 def ensure_growth_schedules(db):
     """补齐成长任务相关定时任务（幂等）。
 
@@ -1555,21 +1882,48 @@ def _tz_offset() -> timedelta:
 
 
 def _next_keepalive_at(now: datetime) -> datetime:
-    """返回下一个保活整点时刻（**UTC naive**，与 Schedule.next_run_at 同口径）。
+    """返回下一个保活时刻（**UTC naive**，与 Schedule.next_run_at 同口径）。
 
     `now` 传入的是 UTC naive（调度循环统一用 utcnow）。
     这里把 now 换成本地时间判断「今天该跑的小时过没过」，再换回 UTC 存储。
+
+    ## 为什么不是整点（2026-11-06）
+
+    原实现严格落在 `22:00:00` —— 一台每天同一秒开始批量刷 token 的机器。
+    现在按配置的小时 + **±28 分钟的随机偏移**，秒也随机：
+    「今晚 22:14:37」和「明晚 21:36:02」看起来才像人手动点的保活。
+
+    偏移用 `ADMIN_KEEPALIVE_JITTER_MINUTES` 调整，设 0 回到整点。
     """
+    import os
+    import random
+
     tz = _tz_offset()
     now_local = now + tz
     hours = sorted(set(h for h in settings.KEEPALIVE_HOURS if 0 <= h <= 23)) or [22]
+    try:
+        spread = max(0.0, float(os.getenv("ADMIN_KEEPALIVE_JITTER_MINUTES", "28")))
+    except ValueError:
+        spread = 28.0
+
+    def _shift(moment: datetime) -> datetime:
+        if spread <= 0:
+            return moment
+        return moment + timedelta(minutes=random.uniform(-spread, spread),
+                                  seconds=random.uniform(-59, 59))
+
     for h in hours:
         cand_local = now_local.replace(hour=h, minute=0, second=0, microsecond=0)
+        shifted = _shift(cand_local)
+        # 抖动后可能落在「已经过去」—— 那就退回整点，避免任务被判当场到期
+        if shifted > now_local:
+            return shifted - tz
         if cand_local > now_local:
             return cand_local - tz
     nxt = (now_local + timedelta(days=1)).replace(
         hour=hours[0], minute=0, second=0, microsecond=0)
-    return nxt - tz
+    shifted = _shift(nxt)
+    return (shifted if shifted > now_local else nxt) - tz
 
 
 def _keepalive_due(s: "Schedule", now: datetime) -> bool:
@@ -1691,6 +2045,47 @@ _scheduler_lock = threading.Lock()
 _scheduler_started = False
 
 
+#: 定时任务的默认周期与名称后缀。
+#:
+#: 为什么不再只认 `*_checkin` / `*_keepalive`：平台 `task_runners()` 声明的
+#: 任务远不止这两个，整点刷新余额、积分到期快照、模型同步、成长任务都需要在
+#: 库里有一条 Schedule 才会被调度线程执行。只种签到等于「平台接进来了，但只有
+#: 签到会跑」。这里按任务名给出默认周期，已存在的记录一律不覆盖（用户改过的
+#: 周期优先）。
+_TASK_SCHEDULE_META = {
+    "refresh_balances": ("整点刷新余额", 60),
+    "refresh_credits": ("积分到期快照", 360),
+    "sync_models": ("同步模型列表", 360),
+    "daily_checkin": ("每日签到", 1440),
+    "refresh_growth_tasks": ("更新成长任务", 360),
+    "run_growth_tasks": ("自动成长任务", 1440),
+    "run_growth_plan": ("成长计划", 240),
+    "keepalive_tokens": ("令牌保活", 360),
+    "ban_recheck": ("风控封号复核", 30),
+    "daily_activity": ("每日活跃对话", 1440),
+    # WPS 灵犀：签到/保活走默认后缀规则，这里只补两条语义不同的。
+    # 活跃对话必须**每天一次**（360 默认会让一个号一天被用四次，反而更假）；
+    # 失效复检每 2 小时一轮就够，Cookie 过期本来就要人工重粘。
+    "wps_lingxi_activity": ("每日活跃对话", 1440),
+    "wps_lingxi_ban_recheck": ("失效账号复检", 120),
+}
+
+
+def _schedule_meta(task: str, label: str) -> tuple[str, int]:
+    """任务名 → (展示名, 周期分钟)。"""
+    name = str(task)
+    if name in _TASK_SCHEDULE_META:
+        title, minutes = _TASK_SCHEDULE_META[name]
+        return f"{title} · {label}", minutes
+    if name.endswith("_checkin"):
+        return f"每日签到 · {label}", 1440
+    if name.endswith("_keepalive"):
+        return f"会话保活 · {label}", 360
+    if name.endswith("_refresh_quota"):
+        return f"刷新额度 · {label}", 360
+    return f"{name} · {label}", 360
+
+
 def ensure_platform_schedules(db):
     """把**各平台**的签到 / 保活任务补进定时任务表（幂等）。
 
@@ -1734,23 +2129,28 @@ def ensure_platform_schedules(db):
                                Account.status == "active").first()) is not None
         if not has_account:
             continue
+        # 平台 `task_runners()` 声明的任务**全部**补种（不只是签到/保活）：
+        # 各平台只声明自己的任务，不会把 WorkBuddy 的成长任务带进来。
         for task in runners:
             name = str(task)
-            if not (name.endswith("_checkin") or name.endswith("_keepalive")):
+            # ban_recheck 是全局任务，已有 ensure_ban_recheck_schedule 负责，
+            # 这里再按平台种一遍只会变成 N 条重复探测。
+            if name == "ban_recheck":
                 continue
             exists = (db.query(Schedule)
                       .filter(Schedule.task == name,
                               Schedule.platform == storage).first())
             if exists is not None:
                 continue
+            title, minutes = _schedule_meta(name, spec.label)
             is_checkin = name.endswith("_checkin")
             db.add(Schedule(
-                name=("每日签到 · %s" % spec.label) if is_checkin
-                     else ("会话保活 · %s" % spec.label),
+                name=title,
                 task=name,
                 platform=storage,
-                interval_minutes=1440 if is_checkin else 360,
+                interval_minutes=minutes,
                 enabled=1,
+                # 签到错开 5 分钟先跑；其余 15 分钟后排队，避免启动瞬间并发
                 next_run_at=now + (timedelta(minutes=5) if is_checkin
                                    else timedelta(minutes=15)),
             ))
@@ -1802,6 +2202,7 @@ def start_scheduler():
         ensure_credit_schedule(db)
         ensure_ban_recheck_schedule(db)
         ensure_growth_plan_schedule(db)
+        ensure_daily_activity_schedule(db)
         # 各平台（Qoder / Loomy / Trae）的签到与会话保活：缺就补一条
         try:
             ensure_platform_schedules(db)

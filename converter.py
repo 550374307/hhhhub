@@ -469,7 +469,8 @@ class CredentialManager:
         }
         # 企业账号才发归属头：官方只在 enterpriseId 非空时设置它们，
         # 个人账号请求里根本没有这两个头（发空值反而是特征）。
-        enterprise = str(account.get("enterpriseId") or "").strip()
+        enterprise = str(account.get("enterpriseId")
+                         or account.get("enterprise_id") or "").strip()
         if enterprise:
             h["X-Enterprise-Id"] = enterprise
             h["X-Tenant-Id"] = enterprise
@@ -635,6 +636,79 @@ class CredentialManager:
         except Exception as e:
             raise _upstream_error()(f"后端返回非 JSON {method} {path}", r.status_code, r.text) from e
 
+    def ensure_enterprise_id(self, enterprise_id: str) -> None:
+        """把落库的企业 ID 补进会话。
+
+        为什么需要：客户端 `.info` 里通常带 `account.enterpriseId`，但手工
+        导入 / 旧版本凭证可能只有 uid。缺了它 `is_enterprise()` 会判成个人版，
+        于是去调个人积分接口、拿到空结果 —— 表现就是「企业号积分恒为 0」。
+        以库里的 `accounts.enterprise_id` 为准补一次，并随 `export_json()`
+        一起回写，后续所有请求（含 X-Enterprise-Id 头）都正确。
+        """
+        eid = str(enterprise_id or "").strip()
+        if not eid:
+            return
+        with self._lock:
+            session = self._session()
+            acct = session.setdefault("account", {})
+            if str(acct.get("enterpriseId") or "").strip() == eid:
+                return
+            acct["enterpriseId"] = eid
+
+    def is_enterprise(self) -> bool:
+        """是否企业版账号。
+
+        判据与官方客户端完全一致（`isEnterpriseAccount`）：
+        `account.enterpriseId` 非空即是企业版。个人版请求里根本没有这个字段。
+        """
+        s = self._session()
+        acct = s.get("account") or {}
+        eid = acct.get("enterpriseId") or acct.get("enterprise_id") or ""
+        return bool(str(eid).strip())
+
+    def fetch_enterprise_usage(self) -> dict | None:
+        """企业版周期额度（官方 `getEnterpriseUsage` 的同构实现）。
+
+        为什么必须单独一个接口：企业账号打个人的
+        `/get-user-resource-{summary,paid,free}` 会返回空的 Accounts，
+        于是积分恒为 0 —— 但请求照常可用，账单也照常扣。官方客户端在
+        `enterpriseId` 非空时**根本不走**个人那套，改打：
+
+            POST /v2/billing/meter/get-enterprise-user-usage
+            headers: X-Enterprise-Id / X-Tenant-Id（见 _build_headers_from）
+
+        响应 `{limitNum, credit, cycleResetTime}`：
+            limitNum = 本周期总额度（-1 表示不限）
+            credit   = **已消耗**（不是剩余）
+            remain   = limitNum - credit
+
+        取不到（网络/权限/非企业凭证）返回 None，调用方回落到个人口径。
+        """
+        try:
+            data = self._request_backend(
+                "POST", "/v2/billing/meter/get-enterprise-user-usage", {})
+        except Exception:
+            return None
+        node = data.get("data") or {}
+        if isinstance(node.get("data"), dict):
+            node = node["data"]
+        if not isinstance(node, dict):
+            return None
+        limit = node.get("limitNum")
+        if not isinstance(limit, (int, float)):
+            return None
+        used = node.get("credit")
+        used = float(used) if isinstance(used, (int, float)) else 0.0
+        limit = float(limit)
+        unlimited = limit < 0
+        return {
+            "limit": None if unlimited else limit,
+            "used": used,
+            "remain": 0.0 if unlimited else max(0.0, limit - used),
+            "unlimited": unlimited,
+            "reset_at": node.get("cycleResetTime") or node.get("cycleResetTimeStr") or "",
+        }
+
     def _enterprise_path_key(self) -> str:
         """返回模型列表 endpoint 里的 enterprise 段：personal 或 enterpriseId。"""
         s = self._session()
@@ -743,6 +817,21 @@ class CredentialManager:
         CodeBuddy 个人体验版等一次性资源在账号层级 CapacityRemain 仍显示原始额度，
         但当期已用完后 CycleCapacityRemain 为 0；界面上的「累积剩余」也以周期剩余为准。
         """
+        # 企业版没有个人那套 Accounts 结构：先按企业口径取，
+        # 取不到再回落到个人（例如凭证其实是个人号但带了企业字段）。
+        if self.is_enterprise():
+            usage = self.fetch_enterprise_usage()
+            if usage is not None:
+                if usage["unlimited"]:
+                    # 不限额度：没有"总量/剩余"这组数字可填。
+                    # 前端会按 credits_snapshot 里的 unlimited 标记显示「不限」。
+                    return {"total": 0, "remain": 0, "unlimited": True}
+                return {
+                    "total": int(round(usage["limit"] or 0)),
+                    "remain": int(round(usage["remain"])),
+                    "used": int(round(usage["used"])),
+                    "unlimited": False,
+                }
         data = self._request_backend("POST", "/v2/billing/meter/get-user-resource", {})
         resp = data.get("data", {}).get("Response", {}).get("Data", {}) or {}
         total = 0
@@ -1287,25 +1376,16 @@ async def _collect_stream(response: httpx.Response) -> dict:
     注意：上游会把思维链放在 delta.reasoning_content 里（实测 deepseek 系带
     reasoning_effort 时必吐）。早期版本只读 delta.content，导致非流式请求
     的思考内容被整段丢弃——这里显式保留。
-
-    ## 多候选（`n>1`）按 choice.index 分开累积
-
-    与 `admin/routers/proxy._aggregate_chat_sse` 同源（两处必须一致，
-    否则直连网关与后台网关对同一请求给出不同形状）。早期实现把所有
-    choice 的 content 拼进同一个列表、固定输出 `choices:[{index:0}]`，
-    于是 `n=2` 得到 `content: "候选A候选B"` —— 数量少一条且**内容串味**。
     """
-    #: choice.index -> 该候选的累加状态
-    slots: dict[int, dict] = {}
-
-    def slot_for(index: int) -> dict:
-        return slots.setdefault(index, {
-            "content": [], "reasoning": [], "tool_calls": {},
-            "finish_reason": None, "saw_content": False,
-        })
-
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    # tool_calls: index -> {id, name, arguments(分片拼接)}
+    tool_calls: dict[int, dict] = {}
     model: str | None = None
+    finish_reason: str | None = None
     usage: dict | None = None
+    # 兼容上游偶发返回 message（而非 delta）的形态
+    saw_content_delta = False
 
     async for line in response.aiter_lines():
         line = line.strip()
@@ -1321,83 +1401,61 @@ async def _collect_stream(response: httpx.Response) -> dict:
         model = chunk.get("model") or model
         if chunk.get("usage"):
             usage = chunk["usage"]
-        for pos, choice in enumerate(chunk.get("choices") or []):
-            # 上游可能不写 index：用它在本帧 choices 里的位次兜底
-            raw_index = choice.get("index")
-            try:
-                index = int(raw_index) if raw_index is not None else pos
-            except (TypeError, ValueError):
-                index = pos
-            slot = slot_for(index)
+        for choice in chunk.get("choices") or []:
             if choice.get("finish_reason"):
-                slot["finish_reason"] = choice["finish_reason"]
+                finish_reason = choice["finish_reason"]
             delta = choice.get("delta") or {}
             if delta.get("content"):
-                slot["content"].append(delta["content"])
-                slot["saw_content"] = True
+                content_parts.append(delta["content"])
+                saw_content_delta = True
             # 思维链：与 content 同等对待，原样保留
             if delta.get("reasoning_content"):
-                slot["reasoning"].append(delta["reasoning_content"])
+                reasoning_parts.append(delta["reasoning_content"])
             # 兜底：上游非 delta 形态（只在从未收到 content delta 时）
             msg = choice.get("message") or {}
-            if not slot["saw_content"] and msg.get("content"):
-                slot["content"].append(msg["content"])
-            if not slot["reasoning"] and msg.get("reasoning_content"):
-                slot["reasoning"].append(msg["reasoning_content"])
+            if not saw_content_delta and msg.get("content"):
+                content_parts.append(msg["content"])
+            if not reasoning_parts and msg.get("reasoning_content"):
+                reasoning_parts.append(msg["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
-                bucket = slot["tool_calls"]
-                tc_slot = bucket.setdefault(
-                    idx, {"id": None, "name": None, "arguments": ""})
+                slot = tool_calls.setdefault(idx, {"id": None, "name": None, "arguments": ""})
                 if tc.get("id"):
-                    tc_slot["id"] = tc["id"]
+                    slot["id"] = tc["id"]
                 fn = tc.get("function") or {}
                 if fn.get("name"):
-                    tc_slot["name"] = fn["name"]
+                    slot["name"] = fn["name"]
                 if fn.get("arguments"):
-                    tc_slot["arguments"] += fn["arguments"]
+                    slot["arguments"] += fn["arguments"]
 
-    if not slots:
-        slots[0] = {"content": [], "reasoning": [], "tool_calls": {},
-                    "finish_reason": None, "saw_content": False}
+    tcs = None
+    if tool_calls:
+        tcs = [
+            {"id": v["id"], "type": "function",
+             "function": {"name": v["name"], "arguments": v["arguments"]}}
+            for _, v in sorted(tool_calls.items())
+        ]
+        finish_reason = finish_reason or "tool_calls"
 
-    choices_out = []
-    for index in sorted(slots):
-        slot = slots[index]
-        finish_reason = slot["finish_reason"]
-        tcs = None
-        if slot["tool_calls"]:
-            tcs = [
-                {"id": v["id"], "type": "function",
-                 "function": {"name": v["name"], "arguments": v["arguments"]}}
-                for _, v in sorted(slot["tool_calls"].items())
-            ]
-            finish_reason = finish_reason or "tool_calls"
-
-        # 输出阶段（length 截断）剔除参数不完整的工具调用，
-        # 避免客户端解析到半个 JSON。按候选各自判断。
-        message = {"role": "assistant",
-                   "content": "".join(slot["content"]) or None}
-        if tcs:
-            message["tool_calls"] = tcs
-            if finish_reason == "length":
-                dropped = upstream_compat.drop_truncated_tool_calls(message)
-                if dropped:
-                    tcs = message.get("tool_calls")
-                    _log(f"剔除 {dropped} 个参数截断的 tool_call"
-                         f"（finish_reason=length, index={index}）")
-        reasoning = "".join(slot["reasoning"])
-        if reasoning:
-            message["reasoning_content"] = reasoning
-        choices_out.append({"index": index, "message": message,
-                            "finish_reason": finish_reason or "stop"})
-
+    # 输出阶段（length 截断）剔除参数不完整的工具调用，避免客户端解析到半个 JSON
+    message = {"role": "assistant", "content": "".join(content_parts) or None}
+    if tcs:
+        message["tool_calls"] = tcs
+        if finish_reason == "length":
+            dropped = upstream_compat.drop_truncated_tool_calls(message)
+            if dropped:
+                tcs = message.get("tool_calls")
+                _log(f"剔除 {dropped} 个参数截断的 tool_call（finish_reason=length）")
+    reasoning = "".join(reasoning_parts)
+    if reasoning:
+        message["reasoning_content"] = reasoning
     return {
         "id": "chatcmpl-" + os.urandom(12).hex(),
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model or "unknown",
-        "choices": choices_out,
+        "choices": [{"index": 0, "message": message,
+                     "finish_reason": finish_reason or "stop"}],
         "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
     }
 
