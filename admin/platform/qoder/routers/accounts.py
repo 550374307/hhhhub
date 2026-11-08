@@ -27,6 +27,23 @@ def _realm_or_400(realm: str) -> str:
     return value
 
 
+class ImportBatchIn(BaseModel):
+    """手机版备份：JSONL（每行一条）或 JSON 数组。
+
+    形态 `{"realm","token","uid","phone","expires_at"}`，不是 WorkBuddy 的
+    `auth/account` 客户端凭证 —— 通用 `/api/accounts/batch` 会拒收，
+    所以走本平台自己的导入逻辑（issue #8）。
+    """
+    text: str = ""
+
+
+@router.post("/import-batch")
+def import_batch(body: ImportBatchIn, _: bool = Depends(require_admin),
+                 db: Session = Depends(get_db)):
+    """从手机版备份批量导入 Qoder 账号（issue #8）。"""
+    return qoder_accounts.import_batch(db, body.text)
+
+
 @router.get("/meta")
 def meta(_: bool = Depends(require_admin)):
     """平台元信息。"""

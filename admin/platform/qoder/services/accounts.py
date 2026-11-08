@@ -382,3 +382,114 @@ def sync_quota(db: Session, account: Account) -> dict:
     return {"ok": True, "remain": remain, "total": total,
             "user_quota": user_quota, "addon_quota": addon_quota,
             "plan": usage.get("userType") or ""}
+
+
+# ---------------------------------------------------------------------------
+# _prefetch_profiles（import_batch 依赖）
+# ---------------------------------------------------------------------------
+def _prefetch_profiles(records: list[dict], workers: int = 16) -> dict[int, dict]:
+    """并发预取每条记录的 profile，返回 `{记录下标: profile}`。
+
+    ## 为什么要有这一步
+
+    批量导入逐个 `import_record` 时，唯一的上游往返就是 `fetch_profile`。
+    串行拉 500 个号 = 500 次往返，实测要好几分钟，前端一直显示「导入中」，
+    用户看到的就是「导入卡死」。这里先把网络部分并发做掉（16 路），
+    落库仍然逐条（本地写，毫秒级）。
+
+    取失败的那条**不放进结果**，交给 `import_record` 自己再试一次 ——
+    保持原来的报错语义（只有「缺 uid 且拉不到 profile」才算失败）。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    todo = []
+    for idx, rec in enumerate(records):
+        token = str(rec.get("token") or rec.get("access_token") or "")
+        if not token:
+            continue
+        realm = str(rec.get("realm") or rec.get("mode") or "cn")
+        if realm not in endpoints.REGIONS:
+            realm = "cn"
+        todo.append((idx, token, realm))
+    if not todo:
+        return {}
+
+    def _one(item):
+        idx, token, realm = item
+        try:
+            return idx, (client.fetch_profile(token, realm) or {})
+        except Exception:  # noqa: BLE001 - 单条失败不阻断整批
+            return idx, None
+
+    out: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(todo)))) as pool:
+        for idx, prof in pool.map(_one, todo):
+            if prof is not None:
+                out[idx] = prof
+    return out
+
+
+# ---------------------------------------------------------------------------
+# import_batch（批量导入，issue #8）
+# ---------------------------------------------------------------------------
+def import_batch(db: Session, text: str) -> dict:
+    """从手机版备份（JSONL / JSON 数组）批量导入 Qoder 账号。
+
+    手机版导出的账号是 `{"realm","token","uid",...}` 形态，走通用
+    `/api/accounts/batch` 会被全部拒收（issue #8：除了 workbuddy 其它都导入失败）。
+    这里复用 `import_record`，逐条幂等入库（_upsert 已按 (platform, uid) 去重）。
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"ok": False, "added": 0, "updated": 0, "failed": 0,
+                "total": 0, "errors": ["没有提供任何凭证"]}
+    records: list[dict] = []
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list):
+        records = [r for r in parsed if isinstance(r, dict)]
+    else:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                records.append(obj)
+    if not records:
+        return {"ok": False, "added": 0, "updated": 0, "failed": 0,
+                "total": 0,
+                "errors": ["没有解析出任何账号记录（应为 JSONL 或 JSON 数组）"]}
+    added = updated = failed = 0
+    errors: list[str] = []
+    # 网络部分先并发做完，落库再逐条（见 _prefetch_profiles 的说明）
+    profiles = _prefetch_profiles(records)
+    for idx, rec in enumerate(records):
+        token = str(rec.get("token") or rec.get("access_token") or "")
+        if not token:
+            failed += 1
+            errors.append("跳过一条：缺少 token")
+            continue
+        uid = str(rec.get("uid") or rec.get("user_id") or "")
+        existed = bool(uid) and db.query(Account).filter(
+            Account.platform == PLATFORM, Account.uid == uid).first() is not None
+        try:
+            import_record(db, rec, profile=profiles.get(idx))
+            if existed:
+                updated += 1
+            else:
+                added += 1
+        except Exception as exc:  # noqa: BLE001 - 单条失败不阻断其余
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            failed += 1
+            errors.append("跳过一条：%s" % str(exc)[:120])
+    return {"ok": failed == 0, "added": added, "updated": updated,
+            "failed": failed, "total": len(records), "errors": errors[:20]}
