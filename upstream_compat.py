@@ -777,16 +777,19 @@ SANITIZE_REWRITES = _PROMPT_TEMPLATE_REWRITES + (
 # 计费指纹来自 Claude Code：它把渠道元数据当**一整行纯文本**塞进 system 的
 # text block，例如
 #   "x-anthropic-billing-header: cc_version=2.1.310.8ea; cc_entrypoint=sdk-cli;"
-# 它不是协议字段，上游只拿它做「是否官方客户端」的渠道识别。
+# 它不是协议字段（真正的 HTTP 头在 backend 的 _headers_for_attempt），上游只拿它
+# 做「是否官方客户端」的渠道识别。零宽对它无效 —— 上游会先归一化零宽再比对。
 #
-# ## 为什么必须整行删（2026-11-05 修正）
+# ## 为什么必须整行删，且 `cch=` 必须独立清（2026-11-05 修正）
 #
 # 旧实现用 `:[^;\n]*;?\s*`，**吃到第一个分号就停**。于是
-#   "x-anthropic-billing-header: cc_version=1.2.3; cc_entrypoint=cli; cch=abc;"
+#   " ; cch=abc;"
 # 只会被删成 "; cch=abc123def;" —— 而 `cch=` 正是渠道校验哈希，残留即指纹。
-# 更糟的是 `has_fingerprint()` 随后返回 False（`x-anthropic-billing-header`
+# 更糟的是 `has_fingerprint()` 随后返回 False（`x-anthropic-billing-hdr`
 # 已经被删掉了），`_sanitize_non_repository_text()` 在开头就 return，
 # 下面 `_KV_RE` / `cc_` 那几层补偿**全都不会执行**。实测就是这么漏出去的。
+# 所以 `cch=<hex>` 必须被 `has_fingerprint()` 独立识别（见 `_CCH_RE`），
+# 并由 `_strip_billing_fingerprint()` 无条件清掉。
 #
 # 整行正则必须**只匹配「整行都是指纹」**：若同一行后面还有自然语言，
 # 交给 `_HDR_INLINE_RE` 只删到分号，避免把用户正文一起吞掉。
@@ -859,13 +862,24 @@ def _sanitize_non_repository_text(text: str) -> str:
 
 
 def _sanitize_content(content):
-    """content 可能是 string 或多模态数组（只动 text part）。"""
+    """content 可能是 string 或多模态数组（只动 text part）。
+
+    整块只有计费指纹时会被删空；部分上游对 `{"type":"text","text":""}`
+    直接 400，所以这里把空块摘掉而不是留空字符串。
+    """
     if isinstance(content, str):
         return sanitize_text(content)
     if isinstance(content, list):
+        kept = []
         for part in content:
             if isinstance(part, dict) and isinstance(part.get("text"), str):
-                part["text"] = sanitize_text(part["text"])
+                before = part["text"]
+                part["text"] = sanitize_text(before)
+                if before.strip() and not part["text"].strip():
+                    continue
+            kept.append(part)
+        if len(kept) != len(content):
+            return kept or ""
         return content
     return content
 
@@ -1604,6 +1618,8 @@ def normalize_harness_body(obj: dict) -> dict:
     返回 roles / orphans / identity / templates / billing 改写统计，
     obj 就地改写，调用方原样发送即可。
     """
+    # 指纹必须在 shield / 脱敏之前删：先行插入的零宽会让整行匹配失效。
+    billing = strip_harness_billing_header(obj)
     shielded = shield_harness_prompt(obj)
     return {
         "roles": normalize_roles(obj),
@@ -1614,6 +1630,7 @@ def normalize_harness_body(obj: dict) -> dict:
         # system 里的指纹行搬进来，先删后搬等于白删。
         "billing": strip_harness_billing_header(obj),
         "shield": shielded,
+        "billing": billing,
     }
 
 
@@ -1828,6 +1845,7 @@ def prepare_upstream_body(obj: dict, *, sanitize: bool = False,
         obj["stream_options"] = {"include_usage": True}
 
     normalize_roles(obj)
+    strip_harness_billing_header(obj)
     shield_harness_prompt(obj)
     normalize_harness_identity(obj)
     normalize_prompt_templates(obj)

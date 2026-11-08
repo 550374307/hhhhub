@@ -55,7 +55,8 @@ PATH_ENT_USAGE = "/trae/api/v1/pay/ide_user_ent_usage"
 PATH_ENT_USAGE_V2 = "/trae/api/v2/pay/ide_user_ent_usage"
 PATH_PAY_STATUS = "/trae/api/v1/pay/ide_user_pay_status"
 
-DEFAULT_TIMEOUT = 300.0
+# 600s：帧间隔上限而非总时长；上游思考静默期（3~4 分钟）不能被掐
+DEFAULT_TIMEOUT = 600.0
 
 #: 双区常量。改动任何一项都属于协议变更，必须先用真实账号回归。
 REALMS = {
@@ -277,15 +278,62 @@ def expiry_of(account) -> float:
     所以入口这里统一归一化成秒，全链路只认秒。
     """
     data = as_mapping(account)
-    for key in ("expired_at", "expiredAt", "expires_at", "TokenExpireAt"):
+    for key in ("expired_at", "expiredAt", "expires_at", "TokenExpireAt",
+                "tokenExpireAt", "expireAt"):
         value = data.get(key)
-        if isinstance(value, str) and value.strip().isdigit():
-            value = int(value.strip())
+        if value is None or value == "":
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text.isdigit():
+                value = int(text)
+            else:
+                # ⚠️ **实测 Trae 国际版给的是 ISO 字符串**：
+                #     "expiredAt": "2026-11-11T02:41:39.607Z"
+                # 老实现只认纯数字，ISO 串被直接跳过 → `expiry_of()` 返回 0
+                # → `is_expired()` 永远是 False → token 真的过期了也不刷新，
+                #    请求一路 401。这里必须把 ISO 也解出来。
+                parsed = _parse_iso(text)
+                if parsed:
+                    return parsed
+                continue
         if isinstance(value, (int, float)) and value > 0:
             number = float(value)
             # 毫秒 -> 秒（上游给的都是毫秒）
             return number / 1000.0 if number > _MS_THRESHOLD else number
     return 0.0
+
+
+def _parse_iso(text: str) -> float:
+    """ISO8601 / RFC3339 → epoch 秒；解析不了返回 0。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return 0.0
+    # Python 3.10 及更早只认 6 位小数，上游给的是 3 位并在末尾带 Z
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    if "." in raw:
+        head, _, tail = raw.partition(".")
+        digits = ""
+        for ch in tail:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        rest = tail[len(digits):]
+        raw = "%s.%s%s" % (head, (digits + "000000")[:6], rest)
+    try:
+        from datetime import datetime
+
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            # 无时区时按 UTC 处理：Trae 的字段都带 Z，走到这里说明上游漏了
+            from datetime import timezone
+
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def is_expired(account, skew: float = 120.0) -> bool:

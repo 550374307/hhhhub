@@ -478,7 +478,8 @@ class JoinIn(BaseModel):
     mobile: str = ""
     country_code: str = "86"
     sms_code: str = ""
-    #: 自助入口凭证（后台生成）。也可放在 X-Join-Invite 头或 invite_code 查询参数。
+    #: 自助入口凭证（后台生成）。也可放在 X-Join-Invite 头。
+    #: **禁止放进 query**：URL 会进访问日志与 Referer。
     invite_code: Optional[str] = ""
 
 
@@ -500,7 +501,8 @@ class JoinIn(BaseModel):
 # **不支持查询参数**：`?invite_code=` 会原样进 nginx access log、浏览器历史、
 # Referer 与书签，等于把一张可用凭证长期写在日志里。历史上这里有过第三处
 # `query_params` 分支（注释写着「分享链接用查询参数」），2026-11-05 删除。
-# 分享链接改用 `#k=<ticket>` fragment —— fragment 不随请求上送、不落服务端日志。
+# 分享链接改用 `#k=<ticket>` fragment（不随请求上送），页面再用它换
+# HttpOnly Cookie —— 见 admin/join_gate.py。
 #
 # 失败一律返回 404 而不是 403 —— 不告诉调用者"入口存在但凭证不对"，
 # 避免变成一个可用于探测有效凭证的 oracle。
@@ -819,7 +821,8 @@ def join_verify(body: JoinIn, request: Request, db: Session = Depends(get_db)):
 
 class OfficialIn(BaseModel):
     sid: Optional[str] = ""
-    #: 自助入口凭证（后台生成）。也可放在 X-Join-Invite 头或 invite_code 查询参数。
+    #: 自助入口凭证（后台生成）。也可放在 X-Join-Invite 头。
+    #: **禁止放进 query**：URL 会进访问日志与 Referer。
     invite_code: Optional[str] = ""
 
 

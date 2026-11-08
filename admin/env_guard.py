@@ -1,23 +1,22 @@
 """环境策略：生产 / 测试隔离 + 启动 fail-fast + 高危路由黑名单。
 
-## 为什么单独一个模块
+为什么单独一个模块
+------------------
+2026-11-02 事故里，攻击者拿到后台会话后做的第一件事是
+`POST /api/app-source/locate` + `GET /api/app-source/search` ——
+这两个接口能 **创建任意目录** 并 **递归读取该目录下的文本文件**，
+用来捞 `.env` / 私钥 / `client_secret`。同一条链上还有
+`/api/maintenance/restore`（用 512MB body 覆盖 sqlite 库文件）和
+`/api/maintenance/restart`（控制进程生死）。
 
-后台会话一旦泄露，攻击者拿到的**不是**一个"看数据"的权限，而是对宿主机
-的任意文件读写能力：
-
-    POST /api/app-source/locate      创建任意目录
-    GET  /api/app-source/search      递归读取该目录下的文本文件
-    POST /api/maintenance/restore    用上传的字节覆盖 sqlite 库文件
-    POST /api/maintenance/restart    控制进程生死
-
-这些能力对本地开发是必要的，对生产是纯粹的 RCE / 信息泄露面。
+这些能力对本地开发是必要的，对生产是纯粹的 RCE/信息泄露面。
 所以策略必须写进代码、在启动时断言，而不是靠运维"记得设环境变量"：
 
-    APP_ENV=prod  ->  不合规就拒绝启动
-    APP_ENV=prod  ->  高危路由一律 404（不依赖路由是否被 include）
+    APP_ENV=prod  →  不合规就拒绝启动
+    APP_ENV=prod  →  高危路由一律 404（不依赖路由是否被 include）
 
-三个环境的职责：
-
+三个环境的职责
+--------------
     prod     正式域名，nginx 反代，仅绑 127.0.0.1，无客户端代码
     staging  内网 + Basic Auth，数据脱敏，可开 DEV_TOOLS
     dev      本地，全量功能
@@ -27,12 +26,13 @@
 ## 与本仓的差异（重要）
 
 上游同名模块会断言 `JOIN_TICKET_SECRET` / `ADMIN_SESSION_SINGLE` /
-`ADMIN_CSRF_ENABLED` —— 那几项属于上游的「服务端会话表 + join 总闸」安全层，
-本仓**没有**这套体系（`admin/session_store.py`、`admin/join_gate.py` 均不存在）。
-照搬会让本仓在 `APP_ENV=prod` 下**无条件启动失败**。
+`ADMIN_CSRF_ENABLED` —— 那几项属于上游的「服务端会话表 + join 总闸」安全层。
+w1 已把 `admin/session_store.py` / `admin/join_gate.py` 一并搬进来，所以
+`JOIN_TICKET_SECRET` 的断言**现在可以生效**（`join_gate._secret()` 在 prod
+下确实要求独立密钥，缺了就起不来，这是对的）。
 
-所以这里只断言本仓真实拥有、且配错就会出事的那些项。等会话层移植进来之后，
-再把对应的断言补上（届时会一起改本文件和 `admin/routers/login.py`）。
+本仓额外保留一条上游没有的断言：`APP_ENV` 必须是 prod/staging/dev 之一。
+拼错（例如 `production`）会被当成 dev 处理，把开发面暴露到生产。
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ def _env_flag(name: str, default: str = "0") -> bool:
 #: 这些前缀的共同点：都能让一次后台会话变成「对宿主机的任意文件/进程操作」。
 #: 注意用前缀匹配而不是精确路径 —— `/api/app-source/{anything}` 整棵树都要挡。
 PROD_BLOCKED_PREFIXES: tuple[str, ...] = (
-    # 任意目录创建 + 递归读取（读 .env / 私钥的直接入口）
+    # 任意目录创建 + 递归读取（事故中读 .env 的入口）
     "/api/app-source",
     # 覆盖数据库文件 / 控制进程生死 / 任意目录写探针
     "/api/maintenance/restore",
@@ -74,7 +74,7 @@ PROD_BLOCKED_PREFIXES: tuple[str, ...] = (
     "/api/accounts/refresh-local",
 )
 
-#: 生产禁止的后缀型路径（用于 `/api/accounts/12/inject` 这类带 id 的路径）。
+#: 生产禁止的后缀型路径（正则风格的通配由调用方展开）。
 PROD_BLOCKED_SUFFIXES: tuple[str, ...] = (
     "/inject",
     "/unpack",
@@ -109,10 +109,10 @@ def is_prod_blocked(path: str) -> bool:
 def local_runtime() -> bool:
     """本机客户端运行时（桌面 EXE / 安卓 WebView）。
 
-    **生产恒为 False** —— 这是最容易出事的一行：只要生产 `.env` 误带
-    `WORKBUDDY_DESKTOP=1`，`/admin` 就会绕过全部鉴权直接下发完整控制台
-    （见 admin/server.py 的 `_console_allowed`）。环境变量是部署时最容易
-    "整体拷过来"的东西，不能让它成为开关。
+    **生产恒为 False** —— 这是 2026-11-02 事故里最危险的一行：
+    只要生产 `.env` 误带 `WORKBUDDY_DESKTOP=1`，`/admin` 就会绕过全部
+    鉴权直接下发完整控制台（server.py 的 `_console_allowed`）。
+    环境变量是部署时最容易"整体拷过来"的东西，不能让它成为开关。
     """
     if IS_PROD:
         return False
@@ -122,14 +122,15 @@ def local_runtime() -> bool:
 def fs_ops_allowed() -> bool:
     """是否允许「任意路径读写 / 目录创建 / 覆盖数据库 / 重启进程」这类运维能力。
 
-    ## 默认**关闭**
+    ## 2026-11-05 改为**默认关闭**
 
-    原实现在非 prod 恒返回 True。问题是「线上到底是不是 prod」完全靠部署方
-    自觉：直接 `python main.py` 且没设 `APP_ENV=prod` 就是 dev，于是
+    原实现在非 prod 恒返回 True。问题是「线上到底是不是 prod」完全靠部署方自觉：
+    直接 `python main.py` 且没设 `APP_ENV=prod` 就是 dev，于是
     `/api/app-source/*`（任意目录 mkdir + 递归读文本）、
-    `/api/maintenance/restore`（上传字节覆盖 sqlite 库）、`/restart`（进程自杀）
-    对**所有持有管理员会话的人**敞开。拿到会话不需要 RCE，靠这几条就能读
-    `.env`、改库、把二进制写到任意目录。
+    `/api/maintenance/restore`（上传字节覆盖 sqlite 库）、`/restart`（进程自杀）、
+    `/api/client-paths/*`（覆盖客户端安装目录）对**所有持有管理员会话的人**敞开。
+    拿到会话（XSS / 凭证泄露）不需要 RCE，靠这几条就能读 `.env`、改库、把
+    二进制写到任意目录 —— 这就是"被当跳板"的真实形态。
 
     现在的规则（按优先级）：
       1. 显式 `ADMIN_ALLOW_FS_OPS=0/1` —— 运维明确指定，永远优先；
@@ -145,14 +146,16 @@ def fs_ops_allowed() -> bool:
     if IS_PROD:
         return False
     # local_runtime() 只读环境变量，不会回调本函数；prod 恒 False。
-    return local_runtime()
+    if local_runtime():
+        return True
+    return False
 
 
 def assert_boot_policy() -> None:
     """生产启动策略断言。不合规直接抛 RuntimeError，让进程起不来。
 
     宁可启动失败（nginx 502，5 秒内可见），也不要带着「DEV_TOOLS 开着 +
-    弱 JWT 密钥 + 全网卡监听」的组合对外服务。
+    弱 JWT 密钥 + 全网卡监听」的组合对外服务 —— 那正是事故当天的状态。
     """
     if APP_ENV not in _ALLOWED_ENVS:
         raise RuntimeError(
@@ -162,12 +165,13 @@ def assert_boot_policy() -> None:
 
     if not IS_PROD:
         # 非 prod 也要挡住最危险的一种误配置：服务绑在公网/全网卡，却带着
-        # 「本机客户端免密」标志 —— `_console_allowed()` 命中时不校验任何
-        # Cookie/JWT，等于 /admin 与 /admin/assets/* 整体裸奔。
+        # 「本机客户端免密」标志 —— server._console_allowed() 命中时不校验
+        # 任何 Cookie/JWT，等于 /admin 与 /admin/assets/* 整体裸奔（事故 R2）。
         #
         # 但客户端打包运行时（桌面 EXE / 安卓 APK）由启动器显式设置
         # `WORKBUDDY_CLIENT_RUNTIME=1`：它们本来就要绑 0.0.0.0 供局域网 /
-        # WebView 访问，数据目录只在本机，属于合法场景。
+        # WebView 访问，数据目录只在本机，属于合法场景（2026-11-05 打包
+        # 冒烟发现：只按 HOST 判断会让两个客户端产物启动即崩）。
         # 源码服务误把 WORKBUDDY_DESKTOP / WORKBUDDY_ANDROID 写进 .env 时
         # 不会带这个标志 —— 那才是要拦的「/admin 裸奔」。
         host = (os.getenv("ADMIN_HOST", "") or "").strip()
@@ -176,13 +180,15 @@ def assert_boot_policy() -> None:
                 and (_env_flag("WORKBUDDY_DESKTOP") or _env_flag("WORKBUDDY_ANDROID"))):
             raise RuntimeError(
                 "启动策略校验失败：ADMIN_HOST=%s 不是回环，却设置了 "
-                "WORKBUDDY_DESKTOP/WORKBUDDY_ANDROID —— 该标志会绕过 /admin "
-                "的全部鉴权。请去掉该变量，或把 APP_ENV 设为 prod"
-                "（prod 下该标志恒被忽略）。" % host)
+                "WORKBUDDY_DESKTOP/WORKBUDDY_ANDROID —— 该标志会绕过 /admin 的全部鉴权。"
+                "请去掉该变量，或把 APP_ENV 设为 prod（prod 下该标志恒被忽略）。" % host)
         return
 
     errs: list[str] = []
     s = config.settings
+
+    if (os.getenv("APP_ENV", "") or "").strip().lower() != "prod":
+        errs.append("APP_ENV 必须显式为 prod")
 
     if getattr(s, "DEV_TOOLS", False):
         errs.append("ADMIN_DEV_TOOLS 必须为 0（/api/app-source/* 生产禁用）")
@@ -194,19 +200,21 @@ def assert_boot_policy() -> None:
 
     host = (os.getenv("ADMIN_HOST", "") or "").strip()
     if host not in ("127.0.0.1", "::1", "localhost"):
-        errs.append("ADMIN_HOST 必须绑回环（当前 %s），只允许 nginx 反代"
-                    % (host or "未设置"))
+        errs.append(f"ADMIN_HOST 必须绑回环（当前 {host or '未设置'}），只允许 nginx 反代")
 
     secret = (getattr(s, "JWT_SECRET", "") or "")
     if len(secret) < 32 or secret.startswith("dev-insecure"):
         errs.append("ADMIN_JWT_SECRET 缺失、过短或仍是开发默认值（需 >=32 字节）")
+
+    if len((os.getenv("JOIN_TICKET_SECRET", "") or "")) < 32:
+        errs.append("JOIN_TICKET_SECRET 未配置或短于 32 字节（join 票据签名密钥）")
 
     try:
         hours = int(getattr(s, "JWT_EXPIRE_HOURS", 24))
     except (TypeError, ValueError):
         hours = 24
     if hours > 8:
-        errs.append("ADMIN_JWT_EXPIRE_HOURS 应 <= 8（当前 %d）" % hours)
+        errs.append(f"ADMIN_JWT_EXPIRE_HOURS 应 <= 8（当前 {hours}）")
 
     origins = getattr(s, "CORS_ORIGINS", ["*"]) or ["*"]
     if "*" in origins:
@@ -217,7 +225,8 @@ def assert_boot_policy() -> None:
 
     if errs:
         raise RuntimeError(
-            "启动策略校验失败 APP_ENV=prod：\n  - " + "\n  - ".join(errs))
+            "启动策略校验失败 APP_ENV=prod：\n  - " + "\n  - ".join(errs)
+        )
 
 
 def describe() -> dict:

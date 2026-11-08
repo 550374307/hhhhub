@@ -16,8 +16,14 @@ ROOT = Path(__file__).resolve().parent.parent
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dist-dir", default="dist", help="Output folder; useful while an older EXE is running")
+    #: PyInstaller 的工作目录（默认项目内 `build/`）。构建机磁盘紧张时，
+    #: 用 `--work-dir D:/wb-build` 把中间产物挪到空间大的盘上 —— 之前 E 盘
+    #: 只剩 0.3G 时，光靠 `--dist-dir` 是救不了的（临时文件还在 E 盘）。
+    parser.add_argument("--work-dir", default="build", help="PyInstaller work folder (intermediate files)")
     args = parser.parse_args()
     destination = (ROOT / args.dist_dir).resolve()
+    work = (ROOT / args.work_dir).resolve() if not os.path.isabs(args.work_dir) \
+        else Path(args.work_dir).resolve()
     if sys.platform != "win32" or platform.machine().lower() not in ("amd64", "x86_64"):
         raise SystemExit("Use Windows x64 with a 64-bit Python interpreter")
     if sys.maxsize <= 2**32:
@@ -53,8 +59,10 @@ def main():
         VarFileInfo([VarStruct('Translation', [1033, 1200])])])'''
     (ROOT / "build/version-resource.txt").write_text(resource, encoding="utf-8")
     env = dict(os.environ, PYTHONUTF8="1")
+    work.mkdir(parents=True, exist_ok=True)
     subprocess.run([sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
                     "--distpath", str(destination),
+                    "--workpath", str(work),
                     str(ROOT / "desktop/miraihub.spec")], cwd=ROOT, env=env, check=True)
     # ⚠️ 产物名必须与 `desktop/miraihub.spec` 里的 `name` 一致。
     # spec 用的是 `release`（可带 -fixN），不是 `version`。

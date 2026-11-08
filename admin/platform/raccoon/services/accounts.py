@@ -330,38 +330,7 @@ def apply_quota(account: Account, quota: dict) -> None:
         "monthly_balance": int(quota.get("monthly_balance") or 0),
         "reward": int(quota.get("reward") or 0),
         "models": int(quota.get("models") or 0),
-        # 完整同步成功 → 明确标记「不是旧值」，用来盖掉上次的 partial 标记
-        "quota_stale": False,
     }, ensure_ascii=False)[:20000]
-
-
-def _apply_partial_quota(account: Account, models_count: int) -> None:
-    """凭证有效但额度读不到时，只回写**确实探到的**部分。
-
-    余额列保持原值（可能是上次成功的快照，也可能是 0）；
-    模型数是刚探到的真实值，必须写；同时打 `quota_stale` 标记，
-    让前端能区分「刚同步过」和「这次同步失败、数值是旧的」。
-    """
-    previous = {}
-    try:
-        previous = json.loads(account.credits_snapshot or "{}") or {}
-    except ValueError:
-        previous = {}
-    previous = previous if isinstance(previous, dict) else {}
-    account.credits_snapshot = json.dumps({
-        "unit": "points",
-        "quota_kind": "balance",
-        "available": int(previous.get("available") or 0),
-        "daily_balance": int(previous.get("daily_balance") or 0),
-        "monthly_balance": int(previous.get("monthly_balance") or 0),
-        "reward": int(previous.get("reward") or 0),
-        "models": int(models_count),
-        # 关键：告诉前端「余额是旧的」
-        "quota_stale": True,
-        "quota_stale_reason": "积分接口不可用",
-    }, ensure_ascii=False)[:20000]
-    account.last_sync_at = datetime.utcnow()
-    account.credits_synced_at = datetime.utcnow()
 
 
 def quota_is_fresh(account: Account) -> bool:
@@ -434,17 +403,20 @@ def sync_quota(db: Session, account: Account, *, mark_disabled: bool = True) -> 
         # 凭证已确认有效，这里只是额度读不到。保留上一次快照，不覆盖成 0。
         logger.info("小浣熊账号 %s 积分接口不可用（%s），保留上次快照",
                     account.id, exc.kind)
-        # ⚠️ 必须把**已知的模型数**写回去。
-        # 早期这里只更新时间戳就返回，结果账号池里所有号都显示「0 模型」，
-        # 看起来像「这个号什么都调不了」，实际它的目录是好的。
-        # 余额沿用旧值（不写 0），模型数是刚探到的真实值，可以写。
-        _apply_partial_quota(account, models_count)
+        account.last_sync_at = datetime.utcnow()
+        account.credits_synced_at = datetime.utcnow()
         db.commit()
         return {"ok": False, "partial": True, "models": models_count,
                 "error": exc.to_dict(),
                 "note": "凭证有效（目录可读），但积分接口不可用；余额沿用上次快照"}
 
     apply_quota(account, quota)
+    # 成功一次就把上一次的错误清掉。
+    # 否则账号池会一直挂着一条早已过期的 `last_err_msg`
+    # （实测：换回可用凭证后，行上仍显示「账号凭证缺少 auth」），
+    # 让人以为号还是坏的。
+    account.last_err_msg = ""
+    account.last_err_at = None
     db.commit()
     return {"ok": True, "quota": quota}
 
@@ -474,10 +446,6 @@ def public_view(account: Account, *, quota: dict | None = None) -> dict:
         "quota_kind": "balance",
         "quota_live": bool(quota) or bool(snapshot),
         "models": int((quota or {}).get("models") or snapshot.get("models") or 0),
-        # 余额是否「过期值」：上游积分接口 403 时会沿用上次快照，
-        # 不打这个标记的话界面无法区分「刚同步」和「同步失败」。
-        "quota_stale": bool(snapshot.get("quota_stale")),
-        "quota_stale_reason": str(snapshot.get("quota_stale_reason") or ""),
         "phone": str(data.get("phone") or ""),
         "has_refresh": bool(refresh_token_of(data)),
         "expires_at": int(data.get("expires_at") or 0),
@@ -569,11 +537,83 @@ def import_record(db: Session, record: dict) -> tuple[Account, bool]:
     existing.last_sync_at = datetime.utcnow()
     db.commit()
     db.refresh(existing)
+    # 入库后自动补刷积分（后台线程）：扫码/导入落库只写凭证，余额列
+    # 原来保持 0，用户进面板还得手动点一次「刷新余额」。与 WorkBuddy
+    # 导入补刷同语义；重复导入（凭证未变）也排一次，成本可忽略。
+    try:
+        from admin.platform import shared as _shared
+        _shared.schedule_import_refresh(PLATFORM, [existing.id])
+    except Exception:  # noqa: BLE001 - 补刷排队失败不影响导入结果
+        pass
     return existing, created
+
+
+def _prefetch_probes(accounts: list[Account], *, workers: int = 16) -> dict[int, dict]:
+    """并发预取探活的**纯网络段**（目录 + 积分），不碰数据库 Session。
+
+    为什么：`import_many` 逐条串行 `sync_quota`，每号要等两次上游往返
+    （目录 + 积分），几百个号就是几分钟 —— 与 workbuddy 批量导入同款病根。
+    网络段并发化（默认 16 路）后，判定与落库仍串行走 sync_quota 同款语义。
+
+    返回（按 account.id）：
+      {"kind": "ok", "models": N, "quota": {...}}        # 目录有货 + 积分到手
+      {"kind": "partial", "models": N, "error": {...}}   # 目录 ok、积分挂
+      {"kind": "empty"}                                  # 目录 200 但空
+      {"kind": "other", "error": {...}}                  # 目录非鉴权失败
+    拿不到 token / 意外异常的账号**不进表** —— apply 阶段回退串行
+    `sync_quota`（它会 ensure_token 刷新过期凭证后再探，语义最全）。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _one(account: Account):
+        aid = int(account.id or 0)
+        try:
+            data = credentials_of(account)
+            token = token_of(data)
+            if not token:
+                return aid, None
+            realm = realm_of(account)
+            models_count = len(client.fetch_models(token, realm, aid))
+        except client.UpstreamError as exc:
+            if exc.kind == "auth":
+                # 不能凭这个就禁用：token 可能只是过期了，串行兜底会先刷新。
+                return aid, {"kind": "refresh"}
+            return aid, {"kind": "other", "error": exc.to_dict()}
+        except Exception:
+            return aid, None
+        if not models_count:
+            return aid, {"kind": "empty"}
+        try:
+            quota = client.fetch_points(token, realm, aid)
+            return aid, {"kind": "ok", "models": models_count, "quota": quota}
+        except client.UpstreamError as exc:
+            # 凭证已确认有效，这里只是额度读不到：保留上次快照（partial 语义）。
+            return aid, {"kind": "partial", "models": models_count,
+                         "error": exc.to_dict()}
+        except Exception:
+            return aid, {"kind": "partial", "models": models_count,
+                         "error": {"kind": "unknown", "message": "积分接口异常"}}
+
+    out: dict[int, dict] = {}
+    if not accounts:
+        return out
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(accounts)))) as pool:
+        for aid, result in pool.map(_one, accounts):
+            if result is not None:
+                out[aid] = result
+    return out
 
 
 def import_many(db: Session, records: list[dict]) -> dict:
     """批量导入。逐条独立，一条失败不影响其它。
+
+    节奏改成了两段（2026-11-06，用户反馈「其它平台也一样速度优化一下」）：
+
+      1. **落库段串行**：`import_record` 逐条幂等入库（它自己 commit）；
+      2. **探活段并发**：`_prefetch_probes` 16 路预取目录 + 积分（纯网络，
+         不碰 Session），判定与落库仍按 `sync_quota` 的原语义串行收尾；
+         预取拿不准的（token 过期 / 意外异常）回退串行 `sync_quota`，
+         它会先刷新凭证再探，不会把「只是过期」的号误判成失效。
 
     导入完成后会**同步模型目录**：`/v1/models` 聚合走的是 `model_configs`
     表（`models_router.build_payload`），不同步的话客户端会看到一个空清单，
@@ -588,6 +628,9 @@ def import_many(db: Session, records: list[dict]) -> dict:
     added = updated = 0
     errors: list[str] = []
     notes: list[str] = []
+
+    # ---- 1) 落库（串行；一条失败不影响其它） ----
+    touched: list[Account] = []
     for idx, rec in enumerate(records, 1):
         try:
             account, created = import_record(db, rec)
@@ -595,15 +638,7 @@ def import_many(db: Session, records: list[dict]) -> dict:
                 added += 1
             else:
                 updated += 1
-            result = sync_quota(db, account)
-            if result.get("ok"):
-                pass
-            elif result.get("partial"):
-                if len(notes) < 3:
-                    notes.append("第 %d 条：%s" % (idx, result.get("note") or "额度暂不可读"))
-            else:
-                err = (result.get("error") or {}).get("message") or "探活失败"
-                errors.append("第 %d 条：%s" % (idx, err))
+            touched.append(account)
         except ValueError as exc:
             errors.append("第 %d 条：%s" % (idx, exc))
         except client.UpstreamError as exc:
@@ -624,6 +659,48 @@ def import_many(db: Session, records: list[dict]) -> dict:
             logger.warning("小浣熊导入第 %d 条失败：%s", idx, type(exc).__name__)
             errors.append("第 %d 条：导入失败（%s），详情见服务端日志"
                           % (idx, type(exc).__name__))
+
+    # ---- 2) 探活：网络段并发预取，判定/落库串行收尾 ----
+    probed = _prefetch_probes(touched)
+    for account in touched:
+        result = probed.get(int(account.id or 0))
+        if result is None or result.get("kind") == "refresh":
+            # 拿不到 token / 意外异常 / 目录鉴权拒绝：走原串行路径 ——
+            # sync_quota 会 ensure_token 刷新过期凭证后再探，不会误判。
+            result = sync_quota(db, account)
+            if result.get("ok"):
+                pass
+            elif result.get("partial"):
+                if len(notes) < 3:
+                    notes.append("账号 %s：%s" % (account.id, result.get("note") or "额度暂不可读"))
+            else:
+                err = (result.get("error") or {}).get("message") or "探活失败"
+                errors.append("账号 %s：%s" % (account.id, err))
+            continue
+        kind = result.get("kind")
+        if kind == "ok":
+            apply_quota(account, result.get("quota") or {})
+            # 成功一次就把上一次的错误清掉，否则账号池会一直挂着
+            # 早已过期的 last_err_msg 让人以为号还是坏的。
+            account.last_err_msg = ""
+            account.last_err_at = None
+            db.commit()
+        elif kind == "partial":
+            # 凭证有效（目录可读），积分读不到：保留上次快照，不覆盖成 0。
+            account.last_sync_at = datetime.utcnow()
+            account.credits_synced_at = datetime.utcnow()
+            db.commit()
+            if len(notes) < 3:
+                notes.append("账号 %s：凭证有效（目录可读），积分接口暂不可用；余额沿用上次快照"
+                             % account.id)
+        elif kind == "empty":
+            # 目录「200 但空」不能当作凭证有效，也不禁用（判据不可用）。
+            logger.info("小浣熊账号 %s 目录为空，凭证有效性无法判定", account.id)
+            if len(notes) < 3:
+                notes.append("账号 %s：目录返回空清单，无法判定凭证有效性" % account.id)
+        else:  # "other"：目录非鉴权失败，不动状态，只记错误
+            err = (result.get("error") or {}).get("message") or "探活失败"
+            errors.append("账号 %s：%s" % (account.id, err))
 
     result = {"added": added, "skipped": updated, "errors": errors,
               "notes": notes}
@@ -715,3 +792,75 @@ def prune_expired(db: Session, *, days: int = 0) -> dict:
     if marked:
         db.commit()
     return {"marked": marked}
+
+
+def import_batch(db: Session, text: str) -> dict:
+    """从备份文本（JSONL / JSON 数组）批量导入小浣熊账号。
+
+    与 `import_many` 的区别只在**入口形态**：
+    控制台「导入账号」把文件原文整段交过来（不预先解析），
+    这里负责拆记录、逐条入库，并返回与其它平台一致的统计字段
+    （`added / updated / failed / total / errors`），
+    这样 `admin/routers/accounts.py::import_accounts_async` 不用为
+    每个平台写一套汇总逻辑。
+
+    认的形状：
+      * 本网关导出的 `agent2api-account`（含 accessToken / uid）
+      * 手机版备份 `{"realm","token","uid","phone","expires_at"}`
+      * 裸 JWT（一行一个）
+    """
+    import json as _json
+
+    from admin.platform.raccoon.services import scan as _scan
+
+    raw = (text or "").strip().lstrip("\ufeff")
+    if not raw:
+        return {"ok": False, "added": 0, "updated": 0, "failed": 0,
+                "total": 0, "errors": ["没有提供任何凭证"]}
+
+    records: list = []
+    try:
+        parsed = _json.loads(raw)
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, list):
+        records = [x for x in parsed if isinstance(x, (dict, str))]
+    elif isinstance(parsed, dict):
+        inner = parsed.get("accounts")
+        if isinstance(inner, list):
+            records = [x for x in inner if isinstance(x, (dict, str))]
+        else:
+            records = [parsed]
+    if not records:
+        for line in raw.splitlines():
+            line = line.strip().rstrip(",")
+            if not line:
+                continue
+            try:
+                item = _json.loads(line)
+            except ValueError:
+                item = line  # 裸 JWT
+            if isinstance(item, (dict, str)):
+                records.append(item)
+
+    if not records:
+        return {"ok": False, "added": 0, "updated": 0, "failed": 0,
+                "total": 0, "errors": ["没有解析出任何凭证（支持 JSON / JSONL / 裸 JWT）"]}
+
+    result = import_many(db, records)
+    added = int(result.get("added") or 0)
+    updated = int(result.get("skipped") or 0)
+    errors = list(result.get("errors") or [])
+    return {
+        "ok": not errors,
+        "added": added,
+        "updated": updated,
+        "failed": len(errors),
+        "total": len(records),
+        "errors": errors[:50],
+        # 保留原字段，前端/日志仍能读到
+        "notes": result.get("notes") or [],
+        "model_sync": result.get("model_sync"),
+        "_scan_hint": ([str(p) for p in _scan.auth_file_candidates()]
+                       if not added and not updated else None),
+    }

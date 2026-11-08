@@ -22,7 +22,7 @@
 ## session 来源
 
 `<configRoot>/userData/auth-session.json`（明文 JSON，137 字节）
-其中 `configRoot = C:/Users/Public/Loomy/<sha256(username)[:12]>`
+其中 `configRoot = %PUBLIC%/Loomy/<sha256(username)[:12]>`（父目录取环境变量）
 """
 from __future__ import annotations
 
@@ -51,8 +51,9 @@ POINTS_RECORDS_PATH = "/points/records"
 POINTS_FIRST_LOGIN_PATH = "/points/first-login"
 
 # ---- 配置目录（userDataPath 是算出来的，不是 %APPDATA%/<产品名>）----
-#: `config-path.js`：C:/Users/Public/Loomy/<sha256(username)[:12]>/userData
-CONFIG_ROOT_PARENT = "C:/Users/Public/Loomy"
+#: `config-path.js`：%PUBLIC%/Loomy/<sha256(username)[:12]>/userData
+#: 只记录「名字」，位置由 services/scan.py 从环境变量动态解析
+CONFIG_ROOT_PARENT = r"%PUBLIC%\Loomy"
 #: 凭证文件名（源码 `new Store({ name: 'auth-session' })`）
 CRED_FILE = "auth-session.json"
 #: 运行时 provider 配置（真实 baseURL 在这里，**不是模板**）
@@ -113,6 +114,37 @@ def points_headers(token: str) -> dict:
     """
     return {"token": token, "Accept": "application/json",
             "User-Agent": user_agent()}
+
+
+def chat_headers(token: str, version: str = "1.0.0", session_id: str = "") -> dict:
+    """chat 链路的完整请求头：鉴权 + **归因头**。
+
+    官方客户端（`utils/request-headers.js`）对每个模型请求都注入
+    `ChatId` / `MsgId` / `TurnId` / `InvokeOrigin` / `X-Loomy-Request-Purpose`。
+    服务端靠它们做计费归因 —— 源码注释原话：缺了这些头的子代理请求
+    「连 ChatId 都没有」，积分归属会失败。
+
+    ⚠️ `ChatId` 是**会话**标识，必须按「账号 + 对话」稳定（由
+    `pool.stable_session_id` 派生后经 `session_id` 传入）。原先每请求
+    `uuid4()` 的写法等于每轮都新建一个会话：上游前缀缓存命中不了，
+    且一个号几分钟内冒出几十个会话，很容易被当成脚本。
+
+    `MsgId` / `TurnId` 仍然是**每请求唯一**：它们标识「一条消息/一轮」，
+    重复值会让上游把两条不同的消息当成同一条（去重/覆盖）。
+    """
+    import uuid as _uuid
+
+    headers = auth_headers(token, version)
+    chat_id = session_id or ("gwchat-" + _uuid.uuid4().hex[:16])
+    msg_id = "gwmsg-" + _uuid.uuid4().hex[:16]
+    headers.update({
+        "ChatId": chat_id,
+        "MsgId": msg_id,
+        "TurnId": msg_id,
+        "InvokeOrigin": "user",
+        "X-Loomy-Request-Purpose": "chat.message",
+    })
+    return headers
 
 
 def base_of(realm: str) -> str:
