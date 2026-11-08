@@ -63,7 +63,6 @@
   var RASTER = {
     loomy: { src: "/admin/assets/logos/loomy-256.png", tone: "color" },
     // 小浣熊：素材取自客户端 `resources/assets/menu-bar-raccoon.png`
-    // 小浣熊：素材取自客户端 `resources/assets/menu-bar-raccoon.png`
     // （930×576 的墨蓝剪影，眼/鼻是**白色实心**而不是镂空，
     //  直接按 alpha 反白会糊成一块白饼 —— 所以按亮度重建了剪影），
     // 再合成到品牌墨蓝圆角底上。自带底色 ⇒ tone=color，
