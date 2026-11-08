@@ -21,6 +21,8 @@ BUILTIN = (
     "admin.platform.loomy",
     "admin.platform.raccoon",
     "admin.platform.codearts",
+    "admin.platform.minimax",
+    "admin.platform.wps_lingxi",
 )
 
 _loaded: list[str] = []
