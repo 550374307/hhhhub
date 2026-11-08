@@ -63,9 +63,21 @@
   var RASTER = {
     loomy: { src: "/admin/assets/logos/loomy-256.png", tone: "color" },
     // 小浣熊：素材取自客户端 `resources/assets/menu-bar-raccoon.png`
+    // （930×576 的墨蓝剪影，眼/鼻是**白色实心**而不是镂空，
+    //  直接按 alpha 反白会糊成一块白饼 —— 所以按亮度重建了剪影），
+    // 再合成到品牌墨蓝圆角底上。自带底色 ⇒ tone=color，
+    // 深浅两种主题都不用额外 filter。
     raccoon: { src: "/admin/assets/logos/raccoon-256.png", tone: "color" },
-    // CodeArts：素材取自客户端 `resources/build/icon.png`（512×512 RGBA）
+    // CodeArts：素材取自客户端 `resources/build/icon.png`（512×512 RGBA），
+    // 紫色圆角底 + 白色图形 —— 自带底色，深浅主题都能直接用，tone=color。
     codearts: { src: "/admin/assets/logos/codearts-256.png", tone: "color" },
+    // MiniMax：素材取自客户端 asar `out/assets/logo/agentLogo.png`
+    // （128×128 RGBA 蓝渐变章鱼）放大到 256。自带底色，tone=color。
+    minimax: { src: "/admin/assets/logos/minimax-256.png", tone: "color" },
+    // WPS 灵犀：素材取自客户端 web 端 manifest 的官方图标
+    // `qn.cache.wpscdn.cn/copilot-test/copilot-cdn/images/copilot/lingxi_logo_512_v1.png`
+    // （512×512 RGBA）缩放到 256。自带渐变底，深浅主题都能直接用，tone=color。
+    wps: { src: "/admin/assets/logos/wps-lingxi-256.png", tone: "color" },
   };
 
   /* 兜底：不要用「加号」（看着像「新建平台」）。 */
@@ -91,12 +103,20 @@
     loomy: "loomy",
     "loomy-cn": "loomy",
     "loomy-intl": "loomy",
-    // 小浣熊只有一个区域（国内站）
+    // 小浣熊只有一个国内站，没有 :cn / :intl 分家
     raccoon: "raccoon",
     "raccoon-cn": "raccoon",
     // CodeArts 只有一个区域（华为云 cn-north-4）
     codearts: "codearts",
     "codearts-cn": "codearts",
+    // MiniMax Code（中国站；国际版凭证走同一平台，domain 区分）
+    minimax: "minimax",
+    "minimax-cn": "minimax",
+    "minimax-en": "minimax",
+    // WPS 灵犀：落库平台名是 wps_lingxi，对外 id 是 wps-lingxi（两种都认）
+    "wps-lingxi": "wps",
+    wps_lingxi: "wps",
+    wps: "wps",
   };
 
   function resolve(id) {
