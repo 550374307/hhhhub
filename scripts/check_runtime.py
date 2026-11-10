@@ -38,7 +38,16 @@ def main():
             with TestClient(app) as client:
                 assert client.get('/api/app/version').status_code == 200
                 assert client.get('/admin').status_code == 200
-                assert client.get('/static/join.html').status_code == 200
+                # join 门禁（上游 2026-11-05 安全加固）：
+                #   公开注册页默认**整体关闭** → /static/join.html 与 /join 一律 404；
+                #   只有票据引导页 /j 可达（短码放在 #k= 片段里，不进服务端日志）。
+                #
+                # 旧断言是 `== 200`，在 join 总闸上线后就一直是错的 —— 只是
+                # 之前没人跑 AI 门禁路径才发现。这里对齐真实行为，**不是**把
+                # 断言改宽：若是有人误把总闸打开，这三条会立刻红。
+                assert client.get('/static/join.html').status_code == 404
+                assert client.get('/join').status_code == 404
+                assert client.get('/j').status_code == 200
                 assert client.post('/v1/audio/transcriptions').status_code == 401
                 from zoneinfo import ZoneInfo
                 assert str(ZoneInfo('Asia/Shanghai')) == 'Asia/Shanghai'

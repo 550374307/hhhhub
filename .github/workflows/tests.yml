@@ -84,3 +84,19 @@ jobs:
         run: |
           python -I tests/test_absorb_regressions.py
           if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # 运行时自检 —— 与发版 workflow 跑的是**同一个脚本**。
+      #
+      # 为什么不早点加：v1.1.1-fix1 打 tag 时才发现它挂在
+      # `assert /static/join.html == 200`，而 join 总闸上线后该路由已恒 404。
+      # 结果是「Tests 全绿、发版必挂」—— 因为 check_runtime.py 只在
+      # desktop-release.yml 里跑，日常提交根本不经过它。
+      #
+      # 现在把它前置到每次提交：发版前就红，而不是打 tag 才发现。
+      - name: Runtime self-check (same script as release)
+        shell: pwsh
+        env:
+          ADMIN_ALLOW_INSECURE_DEFAULT: '1'
+        run: |
+          python scripts/check_runtime.py
+          if ($LASTEXITCODE -ne 0) { exit 1 }
