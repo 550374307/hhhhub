@@ -129,6 +129,12 @@ def init_db() -> bool:
         #
         # 语义是 fail-closed：表里一张有效凭证都没有 → `/join` 与
         # `/api/join/*` 整体关闭（见 admin/join_invite.py）。
+        #
+        # 2026-11-05 加固：加 `epoch` 代次列。任何一次总闸 toggle 都会 +1，
+        # 旧代次的邀请码立即失效 —— 不需要逐条删，也就不会漏删。
+        # ⚠️ 本仓保留：上游无此列，但本地 join_invite.py 依赖它。
+        _ensure_column("join_invites", "epoch", "INT", "NOT NULL DEFAULT 1")
+        _ensure_index("join_invites", "ix_join_invites_epoch", ("epoch",))
 
         # 迁移：给 api_keys 表加 key_full 列（若不存在）
         _ensure_column("api_keys", "key_full", "VARCHAR(2048)", "DEFAULT ''")
@@ -153,9 +159,17 @@ def init_db() -> bool:
 
         # 迁移：给 schedules 表加 stop_after 列（daily_checkin 任务的「停止领取时间」）
         _ensure_column("schedules", "stop_after", "DATETIME", "NULL")
+        # 上游封禁标记：与 status 分开，便于区分「主动停用」与「被上游限制」
+        _ensure_column("accounts", "ban_kind", "VARCHAR(32)", "DEFAULT ''")
+        _ensure_column("accounts", "ban_at", "DATETIME", "NULL")
+        _ensure_column("accounts", "ban_reason", "VARCHAR(500)", "DEFAULT ''")
         # Older MySQL versions reject defaults on TEXT. Existing rows may be
         # NULL; schedule timing treats NULL and an empty config identically.
         _ensure_column("schedules", "timing_config", "TEXT", "NULL")
+
+        # 迁移：登录管理（设备列表显示用，2026-11-10）
+        _ensure_column("admin_sessions", "device_label", "VARCHAR(120)", "DEFAULT ''")
+        _ensure_column("admin_sessions", "ip_label", "VARCHAR(120)", "DEFAULT ''")
 
         # 迁移：给 usage_logs 表加详细用量与真实客户端 IP 列
         _ensure_column("usage_logs", "prompt_tokens", "INT", "NULL")
@@ -194,6 +208,23 @@ def init_db() -> bool:
         _ensure_column("account_model_cool", "upstream_error", "TEXT", "NULL")
         _ensure_column("account_model_cool", "reset_source", "VARCHAR(24)", "DEFAULT ''")
         _ensure_column("accounts", "last_picked_at", "DATETIME", "NULL")
+        # 余额/积分快照的「上次刷新时间」：任务靠它判断哪些号是 stale 的，
+        # 而不是每轮把整个池子重新刷一遍（几千个号那样会永远刷不完）。
+        # ⚠️ 本仓保留：上游无此迁移，但 models.Account.balance_synced_at 仍声明，
+        # 老库（桌面 SQLite）缺列会让 SELECT 整条失败 → /api/accounts 500。
+        _ensure_column("accounts", "balance_synced_at", "DATETIME", "NULL")
+        _ensure_index("accounts", "ix_accounts_balance_synced",
+                      ("platform", "status", "balance_synced_at"))
+
+        # 迁移：定时任务上的「出口代理 + 并发」配置
+        #
+        # 为什么挂在任务上而不是全局：签到可以慢（当天跑完就行，用 1~2 并发），
+        # 余额刷新要快但不能把 IP 打死（用代理组 + 适度并发）。
+        # 两类任务的节奏完全不同，全局一个值必然顾此失彼。
+        _ensure_column("schedules", "proxy_pool", "VARCHAR(32)", "DEFAULT ''")
+        _ensure_column("schedules", "concurrency", "INT", "DEFAULT 0")
+        _ensure_column("schedules", "time_budget_minutes", "INT", "DEFAULT 0")
+        _ensure_column("schedules", "stale_minutes", "INT", "DEFAULT 0")
 
         # 迁移：熔断 / session-dead 连续计数 / 连败降权 / 快过期积分
         # 这些是「跨重启必须保留」的状态：重启后失忆会导致重新踩同一批雷
