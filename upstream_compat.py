@@ -1065,6 +1065,27 @@ def _ensure_usage_credit(usage: dict) -> bool:
     return changed
 
 
+def usage_credit_value(usage) -> float | None:
+    """从任意形态的 usage 里取积分消耗值。上游没给返回 None。
+
+    `_ensure_usage_credit` 只管把已有值补齐成三份同义键，但 Anthropic /
+    Responses 两条链路是**重新构造** usage 对象而不是透传，于是积分在
+    协议转换时整个丢掉 —— Claude Code 和 Codex 的 Usage 里就只剩金额，
+    没有「消耗 N 积分」。这里把取值逻辑单独抽出来，供那两条链路补回去。
+    """
+    if not isinstance(usage, dict):
+        return None
+    for k in _USAGE_CREDIT_KEYS:
+        value = usage.get(k)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 #: usage 里表示「输入命中前缀缓存」的所有已知写法。
 #:
 #: 各家协议各写一套，客户端也只认自己那一套：
@@ -1206,6 +1227,12 @@ def anthropic_usage_from(usage) -> dict | None:
     `cache_read_input_tokens` / `cache_creation_input_tokens`。
     上游只给 Total 的 prompt_tokens，所以这里按「总输入 - 缓存命中」拆开。
     客户端（Claude Code 等）据此显示命中率，漏字段就恒为 0。
+
+    积分（`credit` / `credits` / `cost`）也要一并带出来：这三者在 Anthropic
+    协议里是未知字段，客户端会忽略，但网关自己的用量统计读的是它们。
+    以前这里只返回四个 token 字段，于是 `/v1/messages` 的请求在用量里
+    全都没有积分 —— 同一个模型走 `/v1/chat/completions` 有，走
+    `/v1/messages` 就没有。上游给了才带，免费模型保持无积分。
     """
     if not isinstance(usage, dict) or not usage:
         return None
@@ -1228,12 +1255,17 @@ def anthropic_usage_from(usage) -> dict | None:
             except (TypeError, ValueError):
                 write = 0
             break
-    return {
+    out = {
         "input_tokens": max(0, prompt - cached),
         "output_tokens": completion,
         "cache_read_input_tokens": cached,
         "cache_creation_input_tokens": write,
     }
+    credit = usage_credit_value(usage)
+    if credit is not None:
+        for k in _USAGE_CREDIT_KEYS:
+            out[k] = credit
+    return out
 
 
 def normalize_stream_chunk(obj: dict) -> int:
@@ -1621,16 +1653,17 @@ def normalize_harness_body(obj: dict) -> dict:
     # 指纹必须在 shield / 脱敏之前删：先行插入的零宽会让整行匹配失效。
     billing = strip_harness_billing_header(obj)
     shielded = shield_harness_prompt(obj)
+    # 计费指纹还要在 role 归一**之后**再删一次：developer→system 会把原本
+    # 不在 system 里的指纹行搬进来，先删后搬等于白删。两次计数相加。
+    roles_touched = normalize_roles(obj)
+    billing += strip_harness_billing_header(obj)
     return {
-        "roles": normalize_roles(obj),
+        "roles": roles_touched,
         "orphans": cleanup_orphan_tool_calls(obj),
         "identity": normalize_harness_identity(obj),
         "templates": normalize_prompt_templates(obj),
-        # 计费指纹必须在 role 归一**之后**删：developer→system 会把原本不在
-        # system 里的指纹行搬进来，先删后搬等于白删。
-        "billing": strip_harness_billing_header(obj),
-        "shield": shielded,
         "billing": billing,
+        "shield": shielded,
     }
 
 
@@ -1845,6 +1878,7 @@ def prepare_upstream_body(obj: dict, *, sanitize: bool = False,
         obj["stream_options"] = {"include_usage": True}
 
     normalize_roles(obj)
+    # 第一次：在 shield 插零宽**之前**删，否则整行正则失效。
     strip_harness_billing_header(obj)
     shield_harness_prompt(obj)
     normalize_harness_identity(obj)
