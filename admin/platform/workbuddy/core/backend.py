@@ -216,19 +216,49 @@ def parse_auth_meta(auth_json: str) -> dict:
 class AccountSession:
     """把一个账号的 auth_json 包成可用的后端会话。"""
 
-    def __init__(self, auth_json: str):
+    def __init__(self, auth_json: str, enterprise_id: str = "",
+                 proxy: str = ""):
+        """`proxy` 指定本次会话的出站出口（空 = 直连/走环境变量）。
+
+        ## 为什么要按会话传代理（2026-11-06）
+
+        一个出口 IP 上跑几十个账号，上游会直接把这个 IP 拉黑。而号池
+        动辄几百上千，全从本机一个 IP 出去等于自曝。
+
+        **不能用环境变量 `HTTP_PROXY`**：那是进程级的，多线程并发时
+        改它会让正在跑的请求中途换出口（更可疑），而且线程间互相覆盖。
+        所以出口必须**跟着会话走** —— 每个 worker 线程拿一个自己的
+        AccountSession，也就有了自己的出口。
+        """
         self._http = None
+        #: 本次会话的出站出口（空 = 直连）
+        self.proxy = str(proxy or "").strip()
         #: 本次会话是否发生过 token 刷新（意味着库里那份凭证已经旧了）。
         #: 调用方据此决定要不要 `updated_json()` 回写 —— 只读场景（列表、
         #: 健康检查的失败分支）不该为了一个没变的凭证白跑一次 commit。
         self._token_rotated = False
         self.cm = CredentialManager.from_json(auth_json)
+        # 库里的 enterprise_id 是权威值：凭证里缺就补上，否则企业版会被
+        # 当成个人版，积分接口拿到空结果（= 永远显示 0）。
+        self.cm.ensure_enterprise_id(enterprise_id)
 
     @contextmanager
     def http_client(self, timeout=15):
         """Reuse TLS connections throughout one account's task run."""
+        from admin.upstream_http import ssl_context, upstream_trust_env
         if self._http is None:
-            self._http = httpx.Client(timeout=timeout, limits=HTTP_LIMITS)
+            kwargs = {}
+            if self.proxy:
+                # 显式出口：**同时关掉 trust_env**，否则环境里残留的
+                # HTTP_PROXY 会和这里的代理打架（httpx 会二选一，
+                # 结果就是「明明配了代理却还是从本机 IP 出去」）。
+                kwargs["proxy"] = self.proxy
+                kwargs["trust_env"] = False
+            self._http = httpx.Client(timeout=timeout, limits=HTTP_LIMITS,
+                                     verify=ssl_context(),
+                                     trust_env=kwargs.pop("trust_env",
+                                                          upstream_trust_env()),
+                                     **kwargs)
         self._http.timeout = httpx.Timeout(timeout)
         yield self._http
 
@@ -273,7 +303,9 @@ class AccountSession:
         # The gateway cannot prove that the desktop-only profile headers belong
         # to this server process, so leave this optional header set empty.
         extra = {}
-        with httpx.Client(timeout=5) as client:
+        from admin.upstream_http import ssl_context, upstream_trust_env
+        with httpx.Client(timeout=5, verify=ssl_context(),
+                         trust_env=upstream_trust_env()) as client:
             headers = self.get_headers(extra)
             response = self.cm._request_with_refresh(
                 client, "POST", f"{BACKEND}/v2/chat/busy", headers,
@@ -335,6 +367,13 @@ class AccountSession:
         改名，导致 `admin/credits.py` 按上游原名读取时**一个字段都匹配不上**，
         所有包都被判成「无到期时间 / 剩余 0」，调度依据静默失效。
         """
+        # 企业版：没有个人那三路资源包，额度是「周期总量 - 已消耗」。
+        # 这里把它伪装成单个资源包，让 normalize/summarize/调度整条链路
+        # 原样复用 —— 不给企业版另写一套到期口径。
+        if self.cm.is_enterprise():
+            usage = self.cm.fetch_enterprise_usage()
+            if usage is not None:
+                return _enterprise_packages(usage)
         from admin.billing import collect_billing
         return collect_billing(self.cm._request_backend)
 
@@ -1790,3 +1829,36 @@ def _map_checkin_status(code: int) -> str:
         1002: "not_eligible",      # 无领取资格
         1003: "event_ended",       # 活动已结束
     }.get(code, "unknown")
+
+
+def _enterprise_packages(usage: dict):
+    """把企业版周期额度包装成一个「资源包」。
+
+    字段全部用个人包同名字段（`CycleCapacitySize*/Remain*/Used*`），
+    这样 `admin.credits.resource_summary` 不需要知道企业版的存在：
+        total = limitNum
+        used  = credit
+        remain= limitNum - credit
+    到期时间用 `CycleEndTime`（= 周期重置时间），与个人包的日历年包同义。
+    """
+    from admin.billing import BillingPackages
+
+    limit = usage.get("limit")
+    unlimited = bool(usage.get("unlimited"))
+    row = {
+        "ResourceId": "enterprise-cycle",
+        "PackageCode": "ENTERPRISE_CYCLE",
+        "PackageName": "企业版 · 不限额度" if unlimited else "企业版周期额度",
+        "Status": 0,
+        "CycleCapacitySizePrecise": str(0 if limit is None else limit),
+        "CycleCapacityRemainPrecise": str(0 if unlimited else max(0.0, usage.get("remain") or 0)),
+        "CycleCapacityUsedPrecise": str(max(0.0, usage.get("used") or 0)),
+    }
+    if usage.get("reset_at"):
+        row["CycleEndTime"] = usage["reset_at"]
+    return BillingPackages([row], {
+        "complete": True,
+        "enterprise": True,
+        "unlimited": unlimited,
+        "sources": {"enterprise": {"ok": True, "complete": True, "pages": 1, "rows": 1}},
+    })

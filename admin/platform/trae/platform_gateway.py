@@ -353,8 +353,8 @@ class TraeClientProbe:
         from admin.platform.probe import enrich
         from admin.platform.trae.core import paths as _paths
         return enrich(result,
-                      exe_candidates=_paths.APP_EXE_CANDIDATES,
-                      data_dirs=_paths.DATA_DIR_CANDIDATES,
+                      exe_candidates=_paths.app_exe_candidates(),
+                      data_dirs=_paths.data_dir_candidates(),
                       product=_paths.UA_PRODUCT)
 
     def schema(self) -> list[dict]:
@@ -419,6 +419,36 @@ class TraeGateway:
     # ---- 账号池 ----
     def account_ops(self) -> AccountOps:
         return TraeAccountOps(self.realm)
+
+    # ---- 凭证有效期 ----
+    def credential_expiry(self, auth_json) -> dict:
+        """Trae 的 token 到期时间 + 能不能刷新。
+
+        Trae **有** `refresh_token`：请求路径上 `credentials()` 发现
+        `is_expired()` 就会自动 refresh 并落库，所以只要上游给过
+        refresh_token，这个号就能一直续下去（续期窗口约 60 天）。
+        """
+        from admin.platform import shared
+        from admin.platform.trae.core import client as trae_client
+
+        data = shared.parse_auth_json(auth_json)
+        if not data:
+            return shared.credential_window()
+        # `expiry_of()` 会把上游的毫秒时间戳 / ISO 串都归一成秒
+        expires = trae_client.expiry_of(data)
+        has_refresh = bool(data.get("refresh_token") or data.get("refreshToken")
+                           or data.get("refreshToken"))
+        # Trae 国际版的凭证里同时给 `refreshExpiredAt`（ISO）—— 这才是续期死线
+        refresh_expires = shared.seconds_from(
+            data.get("refresh_expires_at") or data.get("refreshExpiresAt")
+            or data.get("refreshExpiredAt") or data.get("refresh_expired_at"))
+        return shared.credential_window(
+            expires_at=expires,
+            refresh_expires_at=refresh_expires or None,
+            has_refresh=has_refresh)
+
+    def renewal_guard_days(self) -> int:
+        return 7
 
     # ---- 定时任务 ----
     def task_runners(self) -> dict:

@@ -1,9 +1,10 @@
 """Qoder 管理接口：`/api/qoder/*`。"""
 from __future__ import annotations
 
+import json
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Request, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -97,12 +98,60 @@ def import_account(body: ImportIn, _: bool = Depends(require_admin),
     raise HTTPException(400, detail="需要 pat 或 credential")
 
 
+@router.get("/export")
+def export(realm: str = "", mode: str = "", reveal: int = 0,
+           _: bool = Depends(require_admin), db: Session = Depends(get_db)):
+    """导出号池（issue #25：Qoder 国内/国际的导入导出入口都没了）。
+
+    `mode=plain`（默认）→ **脱敏清单**：uid / 昵称 / 邮箱打码 / 余额 / 到期。
+    `mode=backup`       → **完整凭证**：含 token / refresh_token / machine_id，
+                          可直接喂回 `/api/qoder/import-batch` 换机器还原。
+
+    `reveal=1` 是老参数，等同 `mode=backup`。
+
+    返回体同时给 `accounts` 数组（控制台通用导出按钮读它）与 `text`
+    （JSONL，与 `import_batch` 严格对称）—— 这是「导出→导入」能闭环的前提。
+    """
+    realm = _realm_or_400(realm) or "cn"
+    full = bool(reveal) or str(mode or "").strip().lower() == "backup"
+    rows = qoder_accounts.accounts_for(db, realm)
+    records: list[dict] = []
+    for account in rows:
+        record = qoder_accounts.export_record(account, reveal=full)
+        if record:
+            records.append(record)
+    return {"realm": realm, "count": len(records),
+            "mode": "backup" if full else "plain", "reveal": full,
+            "format": "jsonl", "accounts": records,
+            "text": "\n".join(json.dumps(item, ensure_ascii=False) for item in records),
+            "note": ("完整凭证含登录态与设备标识，请私密保存"
+                     if full else
+                     "已脱敏：不含 token，不能直接导入还原同一账号")}
+
+
+class ImportBatchIn(BaseModel):
+    text: str = ""
+
+
+@router.post("/import-batch")
+def import_batch(body: ImportBatchIn, _: bool = Depends(require_admin),
+                 db: Session = Depends(get_db)):
+    """从手机版备份批量导入 Qoder 账号（issue #8：除 workbuddy 外都能导入）。"""
+    return qoder_accounts.import_batch(db, body.text)
+
+
 @router.get("/accounts")
 def list_accounts(realm: str = "", _: bool = Depends(require_admin),
-                  db: Session = Depends(get_db)):
+                  db: Session = Depends(get_db), request: Request = None):
     from admin.platform.qoder.platform_gateway import QoderAccountOps
+    from admin.platform.shared import list_page_params
 
-    return QoderAccountOps(_realm_or_400(realm)).list(db)
+    lp = list_page_params(request)
+    return QoderAccountOps(_realm_or_400(realm)).list(
+        db, page=lp["page"] if lp["paginated"] else None,
+        page_size=lp["page_size"], search=lp["search"], status=lp["status"],
+        sort=lp["sort"], min_credits=lp["min_credits"],
+        max_credits=lp["max_credits"])
 
 
 @router.post("/accounts/{acc_id}/refresh")
