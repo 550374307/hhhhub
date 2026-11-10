@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy.orm import Session
 
@@ -43,6 +43,9 @@ from admin.platform.loomy.core import client, endpoints
 logger = logging.getLogger("admin.platform.loomy.accounts")
 PLATFORM = endpoints.PLATFORM
 QUOTA_TTL = 60
+#: 402（积分不足）的号冷却多久。Loomy 的当日额度**每天重置**，
+#: 10 分钟后重试一次足以发现「是不是刚好跨天了」，又不至于空转。
+QUOTA_COOL_SECONDS = 600
 
 
 def credentials_of(account: Account) -> dict:
@@ -104,6 +107,40 @@ def select(db: Session, realm: str = "", mark_picked: bool = False) -> Account |
     return None
 
 
+def export_record(account: Account, *, reveal: bool = False) -> dict:
+    """单个号 → 可导出记录（与 `import_record` 对称）。
+
+    `reveal=True` 时带上 `token`（完整登录态），导出的 JSONL 能直接喂回
+    `/api/loomy/import-batch` 完成「换机器搬号池」。
+    `reveal=False` 只给台账字段：uid / 手机号打码 / 余额 / 到期时间，
+    不含任何可用于登录的东西 —— 这种文件发给别人也不会泄号。
+    """
+    data = credentials_of(account)
+    token = token_of(data)
+    record: dict = {
+        "platform": PLATFORM,
+        "realm": realm_of(account),
+        "uid": str(account.uid or data.get("uid") or ""),
+        "status": getattr(account, "status", "") or "",
+        "balance_remain": int(getattr(account, "balance_remain", 0) or 0),
+        "balance_total": int(getattr(account, "balance_total", 0) or 0),
+        "session_expires_at": session_expires_at(data) or None,
+    }
+    phone = str(data.get("phone") or "")
+    if phone:
+        record["phone"] = phone if reveal else (
+            phone[:3] + "****" + phone[-4:] if len(phone) >= 7 else "***")
+    if reveal:
+        if not token:
+            return {}
+        record["token"] = token
+        if data.get("password"):
+            record["password"] = data["password"]
+        if data.get("loginid"):
+            record["loginid"] = data["loginid"]
+    return record
+
+
 def apply_quota(account: Account, quota: dict) -> None:
     """写回统一列。
 
@@ -118,6 +155,12 @@ def apply_quota(account: Account, quota: dict) -> None:
 
     `dailyBalance` 每日重置，所以它天然是「会过期的额度」，
     这里映射到 `credits_expiring_soon` 让「积分到期」面板也能看到。
+
+    ## `models` 缺省时**沿用旧值**
+
+    模型清单是**池级**信息（同一 realm 每个号看到的目录一样），批量导入时
+    只探一次（见 `import_batch`）。探活不带 `models` 时必须保留上次的数字，
+    否则每刷一次余额，池子的「可用模型」就被清零一次。
     """
     available = int(quota.get("available") or 0)
     daily = int(quota.get("daily_balance") or 0)
@@ -126,18 +169,42 @@ def apply_quota(account: Account, quota: dict) -> None:
     account.credits_expiring_soon = daily
     account.credits_synced_at = datetime.utcnow()
     account.last_sync_at = datetime.utcnow()
-    account.credits_snapshot = json.dumps({
+    try:
+        previous_snapshot = json.loads(account.credits_snapshot or "{}") or {}
+    except (ValueError, TypeError, AttributeError):
+        previous_snapshot = {}
+    if not isinstance(previous_snapshot, dict):
+        previous_snapshot = {}
+    try:
+        previous_models = int(previous_snapshot.get("models") or 0)
+    except (TypeError, ValueError):
+        previous_models = 0
+    fetched_models = quota.get("models")
+    # ⚠️ **合并**而不是整段重写：`credits_snapshot` 里还存着别的东西
+    # （邀请码状态 `invite` 就是由 `services/invite.py` 写在这里的）。
+    # 原来这里 `json.dumps({...})` 一把覆盖 —— 每次刷余额都会把邀请状态抹掉，
+    # 表现就是「同步完邀请状态，点一下刷新额度又全变未同步」。
+    snapshot = dict(previous_snapshot)
+    snapshot.update({
         "unit": "points",
         "quota_kind": "balance",
         "balance": int(quota.get("balance") or 0),
         "daily_balance": daily,
         "available": available,
-        "models": int(quota.get("models") or 0),
-    }, ensure_ascii=False)[:20000]
+        "models": int(fetched_models) if fetched_models is not None
+                  else previous_models,
+    })
+    account.credits_snapshot = json.dumps(snapshot, ensure_ascii=False)[:20000]
 
 
-def sync_quota(db: Session, account: Account) -> dict:
-    """同步 = 探一次 /models（确认凭证还能用）。"""
+def sync_quota(db: Session, account: Account, *,
+               with_models: bool = True) -> dict:
+    """同步 = 探一次积分接口（可选再探模型目录）。
+
+    `with_models=False` 专供**批量导入**：模型清单是池级的，100 个号逐个拉
+    等于 100 次大 JSON 下载 + 解析（每次几十到几百 KB，重复内容 100 份），
+    这是「导 100 个号要 24 秒」里最没意义的那一半开销。
+    """
     data = ensure_token(db, account)
     realm = realm_of(account)
     token = token_of(data)
@@ -146,25 +213,306 @@ def sync_quota(db: Session, account: Account) -> dict:
         points = client.fetch_points_balance(token, realm, account.id)
         quota.update(points)
     except client.UpstreamError as exc:
+        account.last_err_msg = str(exc.message or "")[:500]
         if exc.kind == "auth":
             account.status = "disabled"
-            db.commit()
+        elif exc.kind == "quota_exceeded":
+            # 402 不是坏号，是暂时没钱。冷却一段时间把它从选号队列里挪开，
+            # 比留在池子里被反复选中、反复 402 好得多。
+            account.cool_until = datetime.utcnow() + timedelta(
+                seconds=QUOTA_COOL_SECONDS)
+            account.cool_kind = "quota"
+        db.commit()
         return {"ok": False, "error": exc.to_dict()}
-    try:
-        models = client.fetch_models(token, realm, account.id)
-        quota["models"] = len(models)
-    except client.UpstreamError:
-        quota.setdefault("models", 0)
+    if with_models:
+        try:
+            models = client.fetch_models(token, realm, account.id)
+            quota["models"] = len(models)
+        except client.UpstreamError:
+            quota.setdefault("models", 0)
     apply_quota(account, quota)
+    # 余额为 0 的号**主动冷却**：它的凭证是好的（积分接口 200），但发对话
+    # 一定被上游 402 打回。留在选号队列里只会让请求先失败一次再换号 ——
+    # 实测 100 个号里有 25 个是这种空号，用户看到的就是「一直 402」。
+    if int(account.balance_remain or 0) <= 0:
+        account.cool_until = datetime.utcnow() + timedelta(
+            seconds=QUOTA_COOL_SECONDS)
+        account.cool_kind = "quota"
     db.commit()
     return {"ok": True, "quota": quota}
 
 
-def public_view(account: Account, *, quota: dict | None = None) -> dict:
-    """给前端的视图（**不含 token**）。"""
+#: 「余额被误清零」的自愈重同步最小间隔（秒）。
+#: 一次请求最多修几个号，避免把一次 402 放大成 50 次积分接口调用。
+HEAL_MIN_INTERVAL = 30.0
+HEAL_MAX_ACCOUNTS = 8
+_heal_lock: dict[str, float] = {}
+
+
+def heal_stale_zero(db: Session, realm: str = "",
+                    limit: int = HEAL_MAX_ACCOUNTS) -> dict:
+    """把「余额是 0 但上游确实发过配额」的号重新同步一次。
+
+    ## 为什么需要它（2026-11-09 实测）
+
+    `shared.note_failure(zero_balance=True)` 历史上只要碰到一次 402 就把
+    `balance_remain` 写成 0。于是号池里出现大量
+    `balance_remain = 0` 而 `balance_total = 4800` 的号 —— 它们**其实有额度**，
+    只是被那一次失败永久摘出了候选集。等所有号都被这么摘掉之后，
+    请求就统一回「所有 Loomy 账号的积分都已用尽」，
+    而用户在控制台看到的是「号池这么多账号，怎么可能都没额度」。
+
+    这里按 `balance_total > 0 and balance_remain <= 0` 挑出这类号，
+    重新拉一次 `/points/balance`（`apply_quota` 会把真实数字写回来），
+    号自动回池。带最小间隔与数量上限，热路径上不会变成风暴。
+    """
+    now = time.time()
+    stamp_key = "global"
+    last = _heal_lock.get(stamp_key) or 0.0
+    if now - last < HEAL_MIN_INTERVAL:
+        return {"ok": True, "skipped": True, "healed": 0, "attempted": 0}
+    query = db.query(Account).filter(
+        Account.platform == PLATFORM,
+        Account.status == "active",
+        Account.balance_total > 0,
+        Account.balance_remain <= 0)
+    if realm:
+        query = query.filter(Account.domain == realm)
+    # 从没同步过的优先：`IS NULL` 排在前面（用布尔表达式，不用
+    # `NULLS FIRST` —— MySQL 不认那个语法，SQLAlchemy 会原样发出去）。
+    rows = query.order_by(Account.last_sync_at.is_(None).desc(),
+                          Account.last_sync_at.asc()).limit(
+        max(1, int(limit))).all()
+    if not rows:
+        return {"ok": True, "skipped": False, "healed": 0, "attempted": 0}
+    _heal_lock[stamp_key] = now
+    healed, failed = 0, 0
+    for account in rows:
+        try:
+            result = sync_quota(db, account, with_models=False)
+        except Exception:  # noqa: BLE001 - 单个号失败不影响其余
+            db.rollback()
+            failed += 1
+            continue
+        if result.get("ok") and int(account.balance_remain or 0) > 0:
+            healed += 1
+        else:
+            failed += 1
+    if healed:
+        logger.info("Loomy 余额自愈：%d 个被误清零的号已恢复（%d 个仍然无额度）",
+                    healed, failed)
+    return {"ok": True, "skipped": False, "healed": healed,
+            "attempted": len(rows), "failed": failed}
+
+
+#: 上游 session 的有效期。**客户端登录时传的就是这个值**
+#: （`electron/xfyun/account-service.js` 的 `expire: 14 * 24 * 3600`），
+#: 所以「签发时间 + 14 天」就是这张票的死线。
+SESSION_TTL_SECONDS = 14 * 24 * 3600
+
+
+def session_expires_at(data: dict | None) -> float:
+    """从凭证里推算 session 到期时间（UTC 秒）；算不出来返回 0。
+
+    ## 为什么要自己算（2026-11-06）
+
+    上游**不回传**有效期，我们原来把它记成 `expires_at = 0`（「未知」），
+    结果就是「某天突然一大批号全废了」—— 用户直到调用失败才知道票过期。
+
+    但有效期其实是可以推出来的：
+      * 客户端 `auth-session.json` 里有 `updatedAt`（**写入时间 = 登录时间**，
+        毫秒时间戳）；
+      * 登录接口的 `expire` 是固定的 14 天。
+
+    于是「登录时间 + 14 天」就是死线。优先级：
+      `updatedAt` → `expires_at`（导入时写过）→ `first_seen_at`
+      （我们第一次确认它有效的时间，**保守下界**）。都没有就返回 0，
+      不瞎猜。
+    """
+    payload = data if isinstance(data, dict) else {}
+    for key in ("updatedAt", "updated_at", "first_seen_at"):
+        raw = payload.get(key)
+        if not raw:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        # 毫秒时间戳（客户端写的是 Date.now()）
+        if value > 1e12:
+            value /= 1000.0
+        if value > 0:
+            return value + SESSION_TTL_SECONDS
+    try:
+        stored = float(payload.get("expires_at") or 0)
+    except (TypeError, ValueError):
+        stored = 0
+    return stored if stored > 0 else 0.0
+
+
+def stamp_first_seen(data: dict) -> dict:
+    """给没有 `updatedAt` 的老凭证补一个 `first_seen_at` 锚点。
+
+    老数据（导入时还没保留 updatedAt）本来算不出死线。但**只要它现在还能用**，
+    就说明「至少从这一刻起还有 14 天」—— 这是保守下界，比「未知」有用得多：
+    用户至少会收到「这张票最晚 X 号到期」的提醒，而不是某天突然发现全挂了。
+    """
+    payload = dict(data or {})
+    if payload.get("updatedAt") or payload.get("first_seen_at"):
+        return payload
+    payload["first_seen_at"] = int(time.time() * 1000)
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# 密码续期（唯一能真正「延长」session 的方式）
+# ---------------------------------------------------------------------------
+#: 剩余多少天开始自动续期。比预警阈值略早，留出重试余量。
+SESSION_RENEW_BEFORE_DAYS = 3.0
+
+
+def has_password(data: dict | None) -> bool:
+    """这个号存了手机号 + 密码吗（没有就只能等它过期后手动重扫）。"""
+    payload = data if isinstance(data, dict) else {}
+    return bool(str(payload.get("loginid") or "").strip()
+                and str(payload.get("password") or "").strip())
+
+
+def set_password(account: Account, loginid: str, password: str) -> dict:
+    """保存登录凭据（供到期自动续期）。
+
+    ⚠️ 密码是**明文存进 auth_json** 的，和 `loomy2api` 那类工具一致 ——
+    没有密码就没法换新 session（服务端没有 refresh 接口）。导出账号备份时
+    这份凭据会一起被带走，提醒用户按凭据对待。
+    """
     data = credentials_of(account)
+    data["loginid"] = str(loginid or "").strip()
+    data["password"] = str(password or "")
+    return data
+
+
+def needs_renewal(data: dict | None) -> bool:
+    """该不该现在续期：有密码 + 剩余天数不足阈值（或已过期）。"""
+    if not has_password(data):
+        return False
+    days = session_days_left(data)
+    if days is None:
+        # 算不出死线但有密码 —— 顺手续一次没坏处（幂等：新票还是 14 天）
+        return False
+    return days <= SESSION_RENEW_BEFORE_DAYS
+
+
+def renew_with_password(db: Session, account: Account) -> dict:
+    """用存好的手机号 + 密码重登，换一张新 session。
+
+    这是「自动续期」的全部实现 —— 服务端没有 refresh token，
+    只能用同一套登录接口重新签发一张 14 天的票。
+
+    成功时同时刷新 `updatedAt` / `expires_at`，并把新 session 落库；
+    失败（密码错 / 需要短信二次验证）**不动原凭据**，原票还能用到过期那天。
+    """
+    from admin.platform.loomy.core import xfyun
+
+    data = credentials_of(account)
+    loginid = str(data.get("loginid") or "").strip()
+    password = str(data.get("password") or "")
+    if not loginid or not password:
+        raise ValueError("账号没有保存手机号/密码，无法自动续期")
+
+    # 每个号一个设备标识：首次续期时生成并固定下来，之后一直复用
+    # （与参考实现一致 —— 同一个号换 devid 反而像异常设备）。
+    devid = str(data.get("devid") or "").strip()
+    if not devid:
+        devid = xfyun.new_device_id()
+
+    got = xfyun.login_by_password(loginid, password, devid=devid)
+    now_ms = int(time.time() * 1000)
+    data.update({
+        "token": got["session"],
+        "uid": got.get("userid") or data.get("uid") or "",
+        "phone": got.get("phone") or data.get("phone") or "",
+        "devid": devid,
+        "updatedAt": now_ms,
+        "expires_at": int(now_ms / 1000 + xfyun.SESSION_EXPIRE_SECONDS),
+        "renewed_at": now_ms,
+        "renew_count": int(data.get("renew_count") or 0) + 1,
+    })
+    # 老的 first_seen_at 锚点已经没用了（有真实 updatedAt 了），清掉避免混淆
+    data.pop("first_seen_at", None)
+    account.auth_json = json.dumps(data, ensure_ascii=False)
+    account.status = "active"
+    account.last_err_msg = ""
+    account.session_dead_fails = 0
+    db.commit()
+    return {"ok": True, "session": got["session"][:8] + "…",
+            "days_left": session_days_left(data),
+            "renewed_at": now_ms}
+
+
+def session_days_left(data: dict | None, now: float | None = None) -> float | None:
+    """还剩多少天（负数=已过期；算不出来返回 None）。"""
+    expires = session_expires_at(data)
+    if expires <= 0:
+        return None
+    now = now if now is not None else time.time()
+    return round((expires - now) / 86400.0, 1)
+
+
+#: 剩余多少天算「快到期」—— 提前 3 天足够把号重新扫一遍。
+SESSION_WARN_DAYS = 3.0
+
+
+def _expiring_soon(data: dict | None) -> bool:
+    days = session_days_left(data)
+    return days is not None and days <= SESSION_WARN_DAYS
+
+
+def _invite_state(account: Account) -> dict:
+    """邀请码状态的**本地快照**（列表渲染用，不发上游请求）。
+
+    数据由 `services/invite.py` 写入 `credits_snapshot['invite']`：
+    同步任务、绑定动作、兑换动作都会更新它。列表一次可能拉几百个号，
+    逐号打 `GET /points/activation` 是不现实的。
+    """
+    try:
+        snap = json.loads(account.credits_snapshot or "{}")
+    except (ValueError, TypeError):
+        return {"activated": False, "code": "", "known": False}
+    state = (snap or {}).get("invite") if isinstance(snap, dict) else None
+    if not isinstance(state, dict):
+        return {"activated": False, "code": "", "known": False}
+    return {
+        "activated": bool(state.get("activated")),
+        "code": str(state.get("code") or ""),
+        "note": str(state.get("note") or ""),
+        "at": int(state.get("at") or 0),
+        # known=False 表示还没同步过 —— 前端据此显示「未同步」而不是「未激活」
+        "known": True,
+    }
+
+
+def public_view(account: Account, *, quota: dict | None = None) -> dict:
+    """给前端的视图（**不含 token**）。
+
+    `models` 优先取本次实时探活的结果，没有就回落到快照里的值 ——
+    批量导入只拉一次模型目录（见 `import_batch` 第 5 步），其余号的
+    快照里是上一次的数字，不能因为「这次没探」就显示 0。
+    """
+    data = credentials_of(account)
+    try:
+        snapshot = json.loads(account.credits_snapshot or "{}")
+    except (ValueError, TypeError):
+        snapshot = {}
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    models = (quota or {}).get("models")
+    if models is None:
+        models = snapshot.get("models")
     return {
         "id": account.id,
+        # 前端按账号归属平台选接口（刷新/删除/禁用），少了这个字段就会
+        # 一律退回 WorkBuddy 的 `/api/accounts/*`，报「账号凭证缺少 auth」。
+        "platform": PLATFORM,
         "name": account.name,
         "uid": account.uid,
         "realm": realm_of(account),
@@ -174,11 +522,36 @@ def public_view(account: Account, *, quota: dict | None = None) -> dict:
         "daily_balance": int(getattr(account, "credits_expiring_soon", 0) or 0),
         "quota_kind": "balance",
         "quota_live": bool(quota),
-        "models": int((quota or {}).get("models") or 0),
+        "models": int(models or 0),
         "phone": str(data.get("phone") or ""),
         "has_refresh": False,
+        # ---- 邀请码状态（读本地快照，**不发上游请求**）----
+        # 用户要求「账号池里把账号的邀请状态显示出来」。上游要逐号查，
+        # 列表一次拉 85 个号不可能打 85 次请求，所以由
+        # `invite.sync_all()` / 绑定/兑换时写进 credits_snapshot，这里只读。
+        "invite": _invite_state(account),
+        # 能不能自动续期：只有存了手机号+密码才可以（服务端无 refresh 接口）
+        "renewable": has_password(data),
+        "renew_before_days": SESSION_RENEW_BEFORE_DAYS,
+        "renew_count": int(data.get("renew_count") or 0),
+        # ---- session 有效期（我们按客户端规则自己算的，见 session_expires_at）----
+        # 上游没有 refresh 接口，14 天一到必失效；把死线和剩余天数透出给前端，
+        # 用户在「还剩 3 天」时就能安排重新扫描，而不是某天突然全挂。
+        "session_expires_at": session_expires_at(data) or None,
+        "session_days_left": session_days_left(data),
+        "session_expiring": _expiring_soon(data),
+        # 入库时间：**全平台统一字段**，账号池表格直接渲染这一列。
+        # 没有它，用户只能靠 id 顺序猜「哪几个是刚导进来的」。
+        "created_at": account.created_at.isoformat()
+        if account.created_at else None,
+        "last_used_at": account.last_used_at.isoformat()
+        if account.last_used_at else None,
         "last_sync_at": account.last_sync_at.isoformat()
         if account.last_sync_at else None,
+        "cool_until": account.cool_until.isoformat()
+        if getattr(account, "cool_until", None) else None,
+        "cool_kind": getattr(account, "cool_kind", "") or "",
+        "last_err_msg": getattr(account, "last_err_msg", "") or "",
     }
 
 
@@ -195,10 +568,17 @@ def summarize(rows: list[dict]) -> dict:
     }
 
 
-def import_from_local(db: Session) -> dict:
-    """从本机 auth-session.json 导入（**用户什么都不用做**）。
+def import_from_local(db: Session, uids: list[str] | None = None) -> dict:
+    """从本机 auth-session.json 导入。
 
-    这是 Loomy 的主路径：凭证是明文 JSON，直接读。
+    ## uids 过滤（「导入」不再是静默全导）
+
+    前端已改为「扫描 → 弹窗展示 → 用户点确认」两步；uids 是用户在
+    弹窗里**明确勾选**的账号（扫描结果里的 userid）。为 None 时保持
+    旧行为（全部导入）—— 兼容老调用方（platform_gateway/定时任务）。
+
+    本机通常只有一份 auth-session.json，但过滤语义必须存在：将来
+    FALLBACK_DIRS 里出现多份凭证时，不该再把「用户没选的」也灌进号池。
     """
     from admin.platform.loomy.services import scan
 
@@ -213,8 +593,29 @@ def import_from_local(db: Session) -> dict:
         "uid": str(creds.get("userid") or ""),
         "phone": str(creds.get("phone") or ""),
         "name": "Loomy %s" % (str(creds.get("phone") or "")[-4:] or "account"),
-        "expires_at": 0,
+        # 保留客户端写入时间：14 天有效期的**唯一锚点**（见 session_expires_at）。
+        # 之前这里丢掉了 updatedAt，结果 expires_at 永远是 0 = 「有效期未知」，
+        # 也就没法提醒「再过几天这张票就废了」。
+        "updatedAt": creds.get("updatedAt"),
+        "expires_at": session_expires_at({
+            "updatedAt": creds.get("updatedAt"),
+            "expires_at": 0,
+        }),
     }
+    if uids is not None:
+        wanted = {str(u or "").strip() for u in uids}
+        wanted.discard("")
+        # 前端勾选框携带的是**扫描结果里的打码 uid**（discover 不回完整
+        # token/uid），所以这里同时接受完整 uid 与打码形态的匹配。
+        if wanted and record["uid"] and record["uid"] not in wanted:
+            from admin.platform.loomy.services import scan as _scan
+
+            masked_uid = _scan.mask(record["uid"])
+            masked_phone = _scan.mask(record["phone"]) if record["phone"] else ""
+            if masked_uid not in wanted and masked_phone not in wanted:
+                return {"ok": False, "imported": 0, "reason": "not_selected",
+                        "hint": "本机凭证（uid %s…）不在勾选范围内，未导入"
+                                % record["uid"][:6]}
     result = import_record(db, record)
     return {"ok": True, "imported": 1, **result}
 
@@ -233,6 +634,7 @@ def import_record(db: Session, record: dict) -> dict:
     if uid:
         existing = db.query(Account).filter(Account.platform == PLATFORM,
                                             Account.uid == uid).first()
+    created = existing is None
     if existing is None:
         existing = Account(platform=PLATFORM,
                            name=clean_display_name(str(record.get("name") or uid or "Loomy")),
@@ -242,14 +644,40 @@ def import_record(db: Session, record: dict) -> dict:
     existing.name = clean_display_name(str(record.get("name") or existing.name or uid or "Loomy"))
     existing.uid = uid or existing.uid
     existing.domain = realm
-    existing.auth_json = json.dumps({
+    # ⚠️ **旧的 auth_json 必须合并，不能整段重写**。
+    #
+    # 这里原来只写 realm/token/uid/phone/updatedAt/expires_at，把
+    # `devid` / `loginid` / `password` 全丢了 —— 而这三样正是「到期自动续期」
+    # 依赖的全部信息：
+    #   · 没有 loginid+password → `renew_with_password()` 直接判不可续，
+    #     14 天后 session 报废就只能人工再收一次短信；
+    #   · 没有 devid → 续期会用默认 `web` 重新登录，上游看到「同一账号换设备」。
+    # 于是在控制台走一次「手机号登录/注册」看起来成功，实际续期链是断的。
+    previous = credentials_of(existing)
+    payload = dict(previous)
+    payload.update({
         "realm": realm,
         "token": token,
         "uid": uid,
-        "phone": str(record.get("phone") or ""),
-        "expires_at": int(record.get("expires_at") or 0),
-    }, ensure_ascii=False)
+        "phone": str(record.get("phone") or previous.get("phone") or ""),
+        # 保留客户端写入时间 + 推算出的死线（见 session_expires_at）
+        "updatedAt": record.get("updatedAt") or previous.get("updatedAt"),
+        "expires_at": int(session_expires_at({**previous, **record}) or 0),
+    })
+    for key in ("devid", "loginid", "password"):
+        value = str(record.get(key) or "").strip()
+        if value:
+            payload[key] = value
+        elif key in previous:
+            payload[key] = previous[key]
+    existing.auth_json = json.dumps(payload, ensure_ascii=False)
+    # 导入的 token 一律标「未验证」：probe 会把它刷成 active/disabled。
     existing.status = "active"
+    existing.session_dead_fails = 0
+    existing.consecutive_fails = 0
+    existing.cool_until = None
+    existing.cool_kind = ""
+    existing.last_err_msg = ""
     existing.last_sync_at = datetime.utcnow()
     db.commit()
     db.refresh(existing)
@@ -257,7 +685,7 @@ def import_record(db: Session, record: dict) -> dict:
     # 立刻探一次，确认凭证可用
     probe = sync_quota(db, existing)
     return {"ok": bool(probe.get("ok")) or True,
-            "account_id": existing.id, "uid": uid,
+            "account_id": existing.id, "uid": uid, "created": created,
             "probe": probe}
 
 

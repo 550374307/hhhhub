@@ -66,6 +66,28 @@ def realm_of(account: Account) -> str:
     return str(getattr(account, "domain", "") or "cn")
 
 
+def umid_of(data: dict) -> str:
+    """客户端 UMID 组件生成的设备令牌（签到风控头 `Cosy-MachineToken` 用）。
+
+    ## 为什么签到必须要它（2026-11-09 用户实测反馈）
+
+    Qoder 的签到是「活动领取」，风控身份**按 uid 用 UMID 生成**。
+    不带 `Cosy-Machine*` 三件套时，活动列表里永远只回来
+    `VIEW_DETAILS` 促销 —— 表现就是「签到一直失败 / 没有可领活动」，
+    而换成本机客户端（带 UMID 的 `.info` 那个 exe）就能领到。
+
+    取值顺序（都是**客户端自己的**设备身份，不要伪造）：
+      1. `umid`            —— 显式导入 / `--umid` 写入
+      2. `machine_token` / `machineToken` —— 客户端 info 里的同义字段
+      3. 空串              —— 没有就不带风控头，如实告诉用户缺什么
+    """
+    for key in ("umid", "machine_token", "machineToken"):
+        value = str(data.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def machine_id_of(data: dict) -> str:
     """机器标识（COSY 头要带）。
 
@@ -108,7 +130,9 @@ def ensure_token(db: Session, account: Account) -> dict:
                                    status=exc.status or 401, kind="auth",
                                    detail=exc.detail) from exc
 
-    data["token"] = str(fresh.get("token") or "")
+    # 设备流续期（deviceToken/refresh）上游返回的是 `device_token`，
+    # 只读 `token` 会把账号 token 刷成空串；作业令牌才是 `token`。
+    data["token"] = str(fresh.get("token") or fresh.get("device_token") or "")
     data["refresh_token"] = str(fresh.get("refresh_token") or refresh)
     exp = fresh.get("expires_at")
     if isinstance(exp, str):
@@ -165,8 +189,14 @@ def import_pat(db: Session, pat: str, realm: str = "cn",
             "uid": uid, "name": payload["name"], "realm": realm}
 
 
-def import_record(db: Session, record: dict) -> dict:
-    """导入一条已有凭证（备份 / 手工粘贴）。"""
+def import_record(db: Session, record: dict, *,
+                  profile: dict | None = None) -> dict:
+    """导入一条已有凭证（备份 / 手工粘贴）。
+
+    `profile` 可由调用方**预先批量取好**再传进来：上游 profile 是本函数里
+    唯一的网络往返，逐条串行拉是批量导入慢的主因（见 `import_batch`）。
+    传 `None` 时保持原行为 —— 自己拉一次。
+    """
     if not isinstance(record, dict):
         raise ValueError("凭证必须是对象")
     token = str(record.get("token") or record.get("access_token") or "")
@@ -186,6 +216,13 @@ def import_record(db: Session, record: dict) -> dict:
         "machine_id": str(record.get("machine_id") or uuid.uuid4()),
         "source": str(record.get("source") or "import"),
     }
+    # 签到风控身份：导入时必须一起带过来，否则这台机器上的号**签不了到**
+    # （活动列表只回促销，不回可领权益）。现场见的三种写法都认。
+    for key in ("umid", "machine_token", "machineToken"):
+        value = str(record.get(key) or "").strip()
+        if value:
+            payload["umid"] = value
+            break
     # ⚠️ 总是拉一次 profile —— 不只是为了补 uid。
     #
     # 设备授权返回的凭证里有 uid 但**没有 name**，只在「uid 为空」时
@@ -193,12 +230,13 @@ def import_record(db: Session, record: dict) -> dict:
     # `qoder-cn-main` 而不是真实昵称（lifan2004）。实测发现。
     #
     # 已经有 token 了，这次请求成本很低；失败才降级。
-    try:
-        profile = client.fetch_profile(token, realm)
-    except client.UpstreamError as exc:
-        if not payload["uid"]:
-            raise ValueError("无法校验凭证：%s" % exc.message) from exc
-        profile = {}
+    if profile is None:
+        try:
+            profile = client.fetch_profile(token, realm)
+        except client.UpstreamError as exc:
+            if not payload["uid"]:
+                raise ValueError("无法校验凭证：%s" % exc.message) from exc
+            profile = {}
     if profile:
         payload["uid"] = payload["uid"] or str(profile.get("id") or "")
         payload["name"] = (payload["name"]
@@ -211,6 +249,111 @@ def import_record(db: Session, record: dict) -> dict:
     account = _upsert(db, payload)
     return {"ok": True, "account_id": account.id, "uid": payload["uid"],
             "name": payload["name"], "realm": realm}
+
+
+def _prefetch_profiles(records: list[dict], workers: int = 16) -> dict[int, dict]:
+    """并发预取每条记录的 profile，返回 `{记录下标: profile}`。
+
+    ## 为什么要有这一步
+
+    批量导入逐个 `import_record` 时，唯一的上游往返就是 `fetch_profile`。
+    串行拉 500 个号 = 500 次往返，实测要好几分钟，前端一直显示「导入中」，
+    用户看到的就是「导入卡死」。这里先把网络部分并发做掉（16 路），
+    落库仍然逐条（本地写，毫秒级）。
+
+    取失败的那条**不放进结果**，交给 `import_record` 自己再试一次 ——
+    保持原来的报错语义（只有「缺 uid 且拉不到 profile」才算失败）。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    todo = []
+    for idx, rec in enumerate(records):
+        token = str(rec.get("token") or rec.get("access_token") or "")
+        if not token:
+            continue
+        realm = str(rec.get("realm") or rec.get("mode") or "cn")
+        if realm not in endpoints.REGIONS:
+            realm = "cn"
+        todo.append((idx, token, realm))
+    if not todo:
+        return {}
+
+    def _one(item):
+        idx, token, realm = item
+        try:
+            return idx, (client.fetch_profile(token, realm) or {})
+        except Exception:  # noqa: BLE001 - 单条失败不阻断整批
+            return idx, None
+
+    out: dict[int, dict] = {}
+    with ThreadPoolExecutor(max_workers=max(1, min(workers, len(todo)))) as pool:
+        for idx, prof in pool.map(_one, todo):
+            if prof is not None:
+                out[idx] = prof
+    return out
+
+
+def import_batch(db: Session, text: str) -> dict:
+    """从手机版备份（JSONL / JSON 数组）批量导入 Qoder 账号。
+
+    手机版导出的账号是 `{"realm","token","uid",...}` 形态，走通用
+    `/api/accounts/batch` 会被全部拒收（issue #8：除了 workbuddy 其它都导入失败）。
+    这里复用 `import_record`，逐条幂等入库（_upsert 已按 (platform, uid) 去重）。
+    """
+    text = (text or "").strip()
+    if not text:
+        return {"ok": False, "added": 0, "updated": 0, "failed": 0,
+                "total": 0, "errors": ["没有提供任何凭证"]}
+    records: list[dict] = []
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = None
+    if isinstance(parsed, list):
+        records = [r for r in parsed if isinstance(r, dict)]
+    else:
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            if isinstance(obj, dict):
+                records.append(obj)
+    if not records:
+        return {"ok": False, "added": 0, "updated": 0, "failed": 0,
+                "total": 0,
+                "errors": ["没有解析出任何账号记录（应为 JSONL 或 JSON 数组）"]}
+    added = updated = failed = 0
+    errors: list[str] = []
+    # 网络部分先并发做完，落库再逐条（见 _prefetch_profiles 的说明）
+    profiles = _prefetch_profiles(records)
+    for idx, rec in enumerate(records):
+        token = str(rec.get("token") or rec.get("access_token") or "")
+        if not token:
+            failed += 1
+            errors.append("跳过一条：缺少 token")
+            continue
+        uid = str(rec.get("uid") or rec.get("user_id") or "")
+        existed = bool(uid) and db.query(Account).filter(
+            Account.platform == PLATFORM, Account.uid == uid).first() is not None
+        try:
+            import_record(db, rec, profile=profiles.get(idx))
+            if existed:
+                updated += 1
+            else:
+                added += 1
+        except Exception as exc:  # noqa: BLE001 - 单条失败不阻断其余
+            try:
+                db.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            failed += 1
+            errors.append("跳过一条：%s" % str(exc)[:120])
+    return {"ok": failed == 0, "added": added, "updated": updated,
+            "failed": failed, "total": len(records), "errors": errors[:20]}
 
 
 def _upsert(db: Session, payload: dict) -> Account:
@@ -233,6 +376,15 @@ def _upsert(db: Session, payload: dict) -> Account:
     existing.last_sync_at = datetime.utcnow()
     db.commit()
     db.refresh(existing)
+    # 入库后自动补刷额度（后台线程）：导入/授权落库原来只写凭证，
+    # 余额保持 0，用户得手动点一次「刷新额度」。
+    try:
+        from admin.platform import shared as _shared
+        _shared.schedule_import_refresh(
+            "qoder-intl" if payload.get("realm") == "intl" else "qoder",
+            [existing.id])
+    except Exception:  # noqa: BLE001 - 补刷排队失败不影响导入结果
+        pass
     return existing
 
 
@@ -244,6 +396,55 @@ def accounts_for(db: Session, realm: str = "") -> list[Account]:
     if realm:
         query = query.filter(Account.domain == realm)
     return query.order_by(Account.id.asc()).all()
+
+
+def export_record(account: Account, *, reveal: bool = False) -> dict:
+    """单个号 → 可导出记录（与 `import_record` 对称，issue #25）。
+
+    Qoder 的凭证是作业令牌（`jt-…`）+ 续期令牌，都只能从本机原生层或
+    设备授权拿到 —— 所以「导出/导入」在这个平台上的真实用途是
+    **换机器搬号池**，而不是从客户端抓。
+
+    `reveal=True` 带完整 token / refresh_token / machine_id，
+    导出的 JSONL 能直接喂回 `/api/qoder/import-batch` 还原；
+    `reveal=False` 只给台账字段，不含任何可用于登录的东西。
+    """
+    data = credentials_of(account)
+    token = token_of(data)
+    realm = realm_of(account)
+    record: dict = {
+        "platform": PLATFORM,
+        "realm": realm,
+        "uid": str(account.uid or data.get("uid") or ""),
+        "name": str(getattr(account, "name", "") or data.get("name") or ""),
+        "status": getattr(account, "status", "") or "",
+        "balance_remain": int(getattr(account, "balance_remain", 0) or 0),
+        "balance_total": int(getattr(account, "balance_total", 0) or 0),
+        "expires_at": int(float(data.get("expires_at") or 0)),
+    }
+    email = str(data.get("email") or "")
+    if email:
+        if reveal:
+            record["email"] = email
+        else:
+            local, _, domain = email.partition("@")
+            record["email"] = ("%s***@%s" % (local[:2], domain)) if domain else "***"
+    if reveal:
+        if not token:
+            return {}
+        record["token"] = token
+        record["refresh_token"] = str(data.get("refresh_token") or "")
+        # machine_id 决定 COSY 签名与风控头（Cosy-Machine*）：丢了这个值，
+        # 搬过去的号在新机器上会被判成「换了设备」，签到与对话都可能被拦。
+        record["machine_id"] = machine_id_of(data)
+        # **UMID 必须一起导出**：签到（活动领取）认的就是它。
+        # 丢了 umid 的号导进来能对话、但永远领不到签到权益，
+        # 而控制台只会显示「无活动」，根本看不出缺的是设备身份。
+        umid = umid_of(data)
+        if umid:
+            record["umid"] = umid
+        record["source"] = str(data.get("source") or "export")
+    return record
 
 
 def select(db: Session, realm: str = "", mark_picked: bool = False) -> Account | None:
@@ -270,6 +471,9 @@ def public_view(account: Account, *, usage: dict | None = None) -> dict:
     addon_quota = quota.get("addOnQuota") or {}
     return {
         "id": account.id,
+        # 前端按账号归属平台选接口（刷新/删除/禁用），少了这个字段就会
+        # 一律退回 WorkBuddy 的 `/api/accounts/*`，报「账号凭证缺少 auth」。
+        "platform": PLATFORM,
         "name": account.name,
         "uid": account.uid,
         "realm": realm_of(account),
@@ -287,6 +491,11 @@ def public_view(account: Account, *, usage: dict | None = None) -> dict:
         "machine_id": str(data.get("machine_id") or "")[:8],
         "last_sync_at": account.last_sync_at.isoformat()
         if account.last_sync_at else None,
+        #: 入库时间：账号池表格的「入库时间」列（**全平台统一字段**）
+        "created_at": account.created_at.isoformat()
+        if account.created_at else None,
+        "last_used_at": account.last_used_at.isoformat()
+        if account.last_used_at else None,
         #: 额度是否来自实时拉取（false = 读的 DB 快照，可能落后）
         "quota_live": bool(usage),
     }

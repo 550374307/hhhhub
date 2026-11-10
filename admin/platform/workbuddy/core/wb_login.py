@@ -501,6 +501,7 @@ def get_session(sid: str) -> PhoneLoginSession:
 
 
 def _new_session() -> PhoneLoginSession:
+    from admin.upstream_http import ssl_context, upstream_trust_env
     client = httpx.Client(
         headers={"User-Agent": WEB_UA, "Accept-Language": "zh-CN,zh;q=0.9"},
         follow_redirects=False,
@@ -514,6 +515,8 @@ def _new_session() -> PhoneLoginSession:
         # 总 fd 占用（500 会话 × 10 = 5000 fd，很容易撞 ulimit）。
         limits=httpx.Limits(max_connections=4, max_keepalive_connections=2,
                             keepalive_expiry=30.0),
+        # 上游请求直连、不继承系统代理（躲开加速器 TLS 中间人，见 issue #5）。
+        verify=ssl_context(), trust_env=upstream_trust_env(),
     )
     sid = uuid.uuid4().hex
     return PhoneLoginSession(sid=sid, client=client)
@@ -1019,7 +1022,7 @@ def _extract_upstream_error(exc: Exception) -> tuple[int | None, str]:
     return None, text[:200]
 
 
-def probe_credential_live(credential_json: str) -> LiveProbe:
+def probe_credential_live(credential_json: str, *, with_profile: bool = True) -> LiveProbe:
     """用**真实上游接口**验证凭证：可用性 + 真伪 + 取回真实用户信息。
 
     为什么必须真调上游
@@ -1035,8 +1038,17 @@ def probe_credential_live(credential_json: str) -> LiveProbe:
     --------
     * 用 `fetch_balance()` —— 它打的是 `/v2/billing/meter/get-user-resource`，
       是最轻量的鉴权探测端点（顺带拿到积分）。
-    * 再用 `fetch_models()` 走一遍带 `X-User-Id` 的路径，把上游**真实**
-      账号信息与凭证里声明的做交叉比对。
+    * `with_profile=True`（默认）再用 `fetch_account_profile()`（
+      `/v2/plugin/accounts`）取上游真实账号信息做交叉比对。
+
+    ## `with_profile=False`：批量导入的轻量档
+
+    一次上游往返就够 —— `fetch_balance` 本身就是鉴权探测（伪造令牌在这
+    一步就 401 / 令牌失效码），还顺带把**真实积分**带回来。uid / 昵称
+    退回凭证自带声明（`_apply_meta` 一直支持 profile 为空）。
+    批量导入几百个号时省掉的第二段往返是纯赚的：16 路并发下
+    100 条从 ~7.5s 降到 ~3.8s。防「张冠李戴」的交叉比对保留给
+    单条手工添加（那里一次多几百毫秒无所谓，安全档要拉满）。
 
     与「配额耗尽」的区别
     -------------------
@@ -1074,19 +1086,22 @@ def probe_credential_live(credential_json: str) -> LiveProbe:
             # 那本身就证明令牌是真的（伪造令牌在 fetch_balance 就 401 了）。
             # 但若这个请求明确报「鉴权失败 / 令牌失效」，仍然必须判失败 ——
             # 不能因为「另一个端点恰好放行」就认为凭证没问题。
-            try:
-                profile = sess.fetch_account_profile() or {}
-            except Exception as e:
-                code, _m = _extract_upstream_error(e)
-                if code in _TOKEN_DEAD_CODES:
-                    return LiveProbe(
-                        False, f"上游拒绝该凭证：{_TOKEN_DEAD_CODES[code]}；上游 code={code}，原文：{getattr(e, 'raw_body', str(e))}",
-                        reason="token_dead")
-                if code in (401, 403):
-                    return LiveProbe(
-                        False, f"上游拒绝了凭据验证请求；上游 HTTP/code={code}，原文：{getattr(e, 'raw_body', str(e))}",
-                        reason="auth_failed")
-                _logger.debug("wb_login: fetch_account_profile 失败（忽略）：%s", e)
+            if with_profile:
+                try:
+                    profile = sess.fetch_account_profile() or {}
+                except Exception as e:
+                    code, _m = _extract_upstream_error(e)
+                    if code in _TOKEN_DEAD_CODES:
+                        return LiveProbe(
+                            False, f"上游拒绝该凭证：{_TOKEN_DEAD_CODES[code]}；上游 code={code}，原文：{getattr(e, 'raw_body', str(e))}",
+                            reason="token_dead")
+                    if code in (401, 403):
+                        return LiveProbe(
+                            False, f"上游拒绝了凭据验证请求；上游 HTTP/code={code}，原文：{getattr(e, 'raw_body', str(e))}",
+                            reason="auth_failed")
+                    _logger.debug("wb_login: fetch_account_profile 失败（忽略）：%s", e)
+            # with_profile=False（轻量档）：批量导入只要「令牌有效 + 真实积分」，
+            # 跳过第二段往返 —— uid/昵称退回凭证自带声明。
     except Exception as e:
         code, msg = _extract_upstream_error(e)
         if code in _TOKEN_DEAD_CODES:
@@ -1180,10 +1195,12 @@ def fetch_credential_by_state(state: str) -> dict | None:
     # 一个请求占一个名额，而不是每次上游调用都占 —— 避免嵌套获取名额导致
     # 可用容量被腰斩，也更容易推理「同时在途的登录请求数」。
     try:
+        from admin.upstream_http import ssl_context, upstream_trust_env
         with httpx.Client(
                 headers={"User-Agent": WEB_UA},
                 timeout=httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT,
-                                      pool=HTTP_CONNECT_TIMEOUT)) as c:
+                                      pool=HTTP_CONNECT_TIMEOUT),
+                verify=ssl_context(), trust_env=upstream_trust_env()) as c:
             r = c.get(f"{HOST}/v2/plugin/auth/token", params={"state": state},
                       headers={"Accept": "application/json, text/plain, */*",
                                "X-No-Authorization": "true"})
@@ -1219,9 +1236,11 @@ def build_credential_from_token(token: dict) -> tuple[str, dict]:
     domain = token.get("domain") or urllib.parse.urlparse(HOST).netloc
     account: dict = {}
     try:
+        from admin.upstream_http import ssl_context, upstream_trust_env
         with httpx.Client(headers={"User-Agent": WEB_UA},
                           timeout=httpx.Timeout(HTTP_TIMEOUT, connect=HTTP_CONNECT_TIMEOUT,
-                                                pool=HTTP_CONNECT_TIMEOUT)) as c:
+                                                pool=HTTP_CONNECT_TIMEOUT),
+                          verify=ssl_context(), trust_env=upstream_trust_env()) as c:
             r = c.get(
                 f"{HOST}/v2/plugin/accounts",
                 headers={"Accept": "application/json, text/plain, */*",
