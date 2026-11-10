@@ -1172,7 +1172,14 @@ def _catalog_for_platform(db, storage: str) -> dict:
         return catalog
 
     last_error = None
+    # `tried` 必须在这里初始化（本仓回归修复，勿删）。
+    # 函数末尾要返回「试了谁、为什么都不行」，而不是连原因都拼不出来。
+    # 之前少了这一行却仍在末尾引用，只要默认平台的账号全部失败就会
+    # NameError('tried' is not defined) → POST /api/models/sync 直接 500，
+    # 前端只看到 "Internal Server Error"（非 JSON，r.json() 解析报错）。
+    tried: list[str] = []
     for acc in rows:
+        tried.append(str(getattr(acc, "name", "") or acc.id))
         try:
             from admin import maintenance
 
